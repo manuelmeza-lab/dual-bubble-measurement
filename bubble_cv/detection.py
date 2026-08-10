@@ -213,7 +213,7 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
         "semi_major": semi_major,
         "semi_minor": semi_minor,
         "eccentricity": eccentricity(semi_major, semi_minor),
-        "equiv_diameter_px": equivalent_diameter(semi_major, semi_minor) * 2.0,
+        "equiv_diameter_px": equivalent_diameter(semi_major, semi_minor),
     }
 
 
