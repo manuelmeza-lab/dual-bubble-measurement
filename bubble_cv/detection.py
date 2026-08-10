@@ -877,6 +877,185 @@ def detect_bubbles(
         "sample":  detection_sample,
     }
 
+# ---------------------------------------------------------------------------
+# Single-object reference detector — used by calibration only
+# ---------------------------------------------------------------------------
+
+def detect_reference_object(
+    frame: np.ndarray,
+    min_radius: int = 50,
+    max_radius: int = 500,
+    blur_kernel: int = 7,
+    clip_limit: float = 3.0,
+    hough_dp: float = 1.2,
+    hough_param1: float = 100.0,
+    hough_param2: float = 20.0,
+) -> float | None:
+    """Detect a single circular reference object and return its Hough diameter.
+
+    Designed for calibration images (e.g. a 4 mm metallic ball bearing).
+    This function is completely independent of :func:`detect_bubbles`:
+
+    * Works on the **full frame** — no dual ROIs.
+    * Accepts and uses ``min_radius`` / ``max_radius`` directly.
+    * Does **not** apply pendant-drop geometry filters (no centre-y window,
+      no edge-proximity check, no axis_ratio / eccentricity thresholds, no
+      bodyellipse neck-isolation).
+    * Does **not** assume a capillary is present.
+
+    The primary metric is the **Hough circle diameter** (``2 × hr_float``),
+    which is robust for a symmetric spherical reference object.  An ellipse
+    fit is performed on the Otsu mask purely as a quality diagnostic; a
+    WARNING is emitted if the two estimates diverge by more than 5 %.
+
+    Algorithm
+    ---------
+    1. Preprocess (grayscale + CLAHE + Gaussian blur).
+    2. HoughCircles on the full frame; keep the raw float radius ``hr_f``.
+    3. ``hough_diameter_px = 2 · hr_f``  ← primary calibration metric.
+    4. Dynamic crop + Otsu + MORPH_CLOSE + fitEllipse (diagnostic only).
+    5. If |ellipse_equiv − hough_diam| / hough_diam > 5 % → logger.warning.
+    6. Return ``hough_diameter_px``.
+
+    Args:
+        frame        : Full BGR image containing the reference object.
+        min_radius   : Minimum Hough circle radius in pixels.
+        max_radius   : Maximum Hough circle radius in pixels.
+        blur_kernel  : Gaussian blur kernel size for preprocessing.
+        clip_limit   : CLAHE clip limit for preprocessing.
+        hough_dp     : Inverse accumulator resolution ratio.
+        hough_param1 : Canny high threshold for Hough.
+        hough_param2 : Accumulator threshold for Hough circle centres.
+
+    Returns:
+        Hough diameter of the reference object in pixels, or ``None``
+        if Hough detection fails.
+    """
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        logger.error(
+            "detect_reference_object: expected 3-channel BGR image; got shape %s.",
+            frame.shape,
+        )
+        return None
+
+    frame_h, frame_w = frame.shape[:2]
+
+    # 1. Preprocess full frame
+    gray = preprocess(frame, blur_kernel=blur_kernel, clip_limit=clip_limit)
+
+    # 2. Hough Circle Transform on the full frame
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=hough_dp,
+        minDist=min_radius * 2,
+        param1=hough_param1,
+        param2=hough_param2,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+
+    if circles is None:
+        logger.error(
+            "detect_reference_object: Hough found no circles "
+            "(min_radius=%d, max_radius=%d).", min_radius, max_radius,
+        )
+        return None
+
+    # OpenCV returns circles sorted by accumulator score (best first).
+    # Keep the raw float values — rounding is only for integer indexing.
+    n_found = len(circles[0])
+    logger.debug("detect_reference_object: Hough found %d circle(s).", n_found)
+
+    best = circles[0][0]                              # float32 array [cx, cy, r]
+    hcx_f, hcy_f, hr_f = float(best[0]), float(best[1]), float(best[2])
+    hcx = int(round(hcx_f))
+    hcy = int(round(hcy_f))
+    hr  = int(round(hr_f))
+
+    # 3. Primary calibration metric — Hough diameter (float precision)
+    hough_diameter_px = 2.0 * hr_f
+
+    logger.info(
+        "detect_reference_object [Hough]: "
+        "center=(%.2f, %.2f)  radius=%.2f px  diameter=%.2f px",
+        hcx_f, hcy_f, hr_f, hough_diameter_px,
+    )
+
+    # 4. Dynamic crop + Otsu + MORPH_CLOSE + fitEllipse (diagnostic only)
+    _MARGIN = 1.3
+    margin = int(hr * _MARGIN)
+    dx0 = max(0, hcx - margin)
+    dy0 = max(0, hcy - margin)
+    dx1 = min(frame_w, hcx + margin)
+    dy1 = min(frame_h, hcy + margin)
+
+    ellipse_equiv: float | None = None
+    if dx1 > dx0 and dy1 > dy0:
+        gray_dyn = gray[dy0:dy1, dx0:dx1]
+
+        _, mask_dyn = cv2.threshold(
+            gray_dyn, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+        )
+        close_kernel = np.ones((5, 5), np.uint8)
+        mask_dyn = cv2.morphologyEx(
+            mask_dyn, cv2.MORPH_CLOSE, close_kernel, iterations=1
+        )
+
+        contours, _ = cv2.findContours(
+            mask_dyn, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if contours:
+            best_cnt = max(contours, key=cv2.contourArea)
+            if len(best_cnt) >= 5:
+                (_, _), (axis1, axis2), _ = cv2.fitEllipse(best_cnt)
+                semi_major = max(axis1, axis2) / 2.0
+                semi_minor = min(axis1, axis2) / 2.0
+                axis_ratio = semi_minor / semi_major
+                # geometry.equivalent_diameter already returns 2·√(a·b)
+                ellipse_equiv = equivalent_diameter(semi_major, semi_minor)
+
+                logger.info(
+                    "detect_reference_object [ellipse diagnostic]: "
+                    "major=%.2f px  minor=%.2f px  axis_ratio=%.4f  "
+                    "equiv_diameter=%.2f px",
+                    semi_major * 2, semi_minor * 2, axis_ratio, ellipse_equiv,
+                )
+            else:
+                logger.debug(
+                    "detect_reference_object: body contour has %d pts; "
+                    "ellipse diagnostic skipped.", len(best_cnt),
+                )
+        else:
+            logger.debug(
+                "detect_reference_object: no contours in dynamic crop; "
+                "ellipse diagnostic skipped."
+            )
+    else:
+        logger.debug(
+            "detect_reference_object: dynamic crop degenerate (%d,%d)-(%d,%d); "
+            "ellipse diagnostic skipped.", dx0, dy0, dx1, dy1,
+        )
+
+    # 5. Warn if ellipse and Hough estimates diverge by more than 5 %
+    if ellipse_equiv is not None:
+        diff_pct = abs(ellipse_equiv - hough_diameter_px) / hough_diameter_px * 100.0
+        logger.info(
+            "detect_reference_object [difference ellipse-vs-Hough]: %.2f %%",
+            diff_pct,
+        )
+        if diff_pct > 5.0:
+            logger.warning(
+                "detect_reference_object: ellipse equiv diameter (%.2f px) "
+                "differs from Hough diameter (%.2f px) by %.2f %% (> 5 %%). "
+                "Check for glare, shadows, or partial occlusion of the reference.",
+                ellipse_equiv, hough_diameter_px, diff_pct,
+            )
+
+    # 6. Return Hough diameter — robust primary metric for a spherical reference
+    return hough_diameter_px
+
 
 # ---------------------------------------------------------------------------
 # Legacy single-drop shim (kept for backward compatibility with scripts that

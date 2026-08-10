@@ -1,9 +1,13 @@
 """
 Calibration module — Spatial calibration using a known reference object.
 
-Uses the same two-stage detection pipeline to measure a reference
-object (e.g., a 4mm metallic sphere) and compute the pixels-per-millimeter
+Uses a dedicated single-object detector to measure a reference object
+(e.g., a 4 mm metallic sphere) and compute the pixels-per-millimetre
 ratio for subsequent bubble measurements.
+
+The calibration detector is completely independent of the dual pendant-drop
+pipeline: it works on the full frame, uses caller-supplied Hough radius
+limits, and applies no drop-specific geometry filters.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import logging
 
 import numpy as np
 
-from bubble_cv.detection import detect_bubble
+from bubble_cv.detection import detect_reference_object
 
 logger = logging.getLogger(__name__)
 
@@ -26,43 +30,47 @@ def calibrate(
 ) -> float | None:
     """Compute px/mm ratio from a reference object of known size.
 
-    Detects the reference object in the frame and computes the
+    Detects the reference object in the frame using
+    :func:`~bubble_cv.detection.detect_reference_object` and computes the
     calibration ratio based on its known diameter.
 
     Args:
-        frame: BGR image containing the reference object.
-        known_diameter_mm: Known diameter of the reference object (mm).
-        min_radius: Minimum expected radius of the reference object (px).
-        max_radius: Maximum expected radius of the reference object (px).
-        **detection_kwargs: Additional keyword arguments passed to
-            detect_bubble() (e.g., hough_param1, clip_limit).
+        frame             : BGR image containing the reference object.
+        known_diameter_mm : Known diameter of the reference object (mm).
+        min_radius        : Minimum expected radius of the reference object (px).
+        max_radius        : Maximum expected radius of the reference object (px).
+        **detection_kwargs: Additional keyword arguments forwarded to
+                            ``detect_reference_object()``
+                            (e.g. ``blur_kernel``, ``clip_limit``,
+                            ``hough_param1``, ``hough_param2``).
 
     Returns:
-        Pixels-per-millimeter ratio, or None if detection fails.
+        Pixels-per-millimetre ratio, or ``None`` if detection fails.
     """
-    detection = detect_bubble(
+    measured_diameter_px = detect_reference_object(
         frame,
-        px_to_mm=None,  # No calibration yet
         min_radius=min_radius,
         max_radius=max_radius,
         **detection_kwargs,
     )
 
-    if detection is None:
+    if measured_diameter_px is None:
         logger.error("Calibration failed: could not detect reference object.")
         return None
 
-    measured_diameter_px = detection.equiv_diameter_px
     if measured_diameter_px <= 0:
-        logger.error("Calibration failed: measured diameter is zero.")
+        logger.error(
+            "Calibration failed: measured diameter is %.4f px (must be > 0).",
+            measured_diameter_px,
+        )
         return None
 
     px_to_mm = measured_diameter_px / known_diameter_mm
 
     logger.info(
-        "Calibration result: %.2f px/mm "
-        "(measured %.1f px for %.1f mm reference, method=%s)",
-        px_to_mm, measured_diameter_px, known_diameter_mm, detection.method,
+        "Calibration: reference diameter detected = %.2f px  |  "
+        "known diameter = %.2f mm  |  calibration = %.4f px/mm",
+        measured_diameter_px, known_diameter_mm, px_to_mm,
     )
 
     return px_to_mm
