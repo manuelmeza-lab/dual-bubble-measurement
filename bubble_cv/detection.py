@@ -392,6 +392,7 @@ def _detect_drop_in_roi(
     # 4–5. Evaluate every Hough candidate
     # ------------------------------------------------------------------
     candidates: list[tuple[float, dict, np.ndarray]] = []  # (score, props_global, global_cnt)
+    rejected_shape: int = 0
 
     for idx, circle in enumerate(circles_round):
         hcx, hcy, hr = int(circle[0]), int(circle[1]), int(circle[2])
@@ -518,19 +519,41 @@ def _detect_drop_in_roi(
             )
             continue
 
+        # ---- Filter 4: shape plausibility (reject extreme elongation) ------
+        axis_ratio  = minor / major          # in (0, 1]; closer to 1 = rounder
+        ecc         = props_g["eccentricity"]
+
+        if axis_ratio < 0.50:
+            logger.debug(
+                "ROI [%s] circle #%d: axis_ratio=%.3f < 0.50 — rejected (too elongated).",
+                roi_label, idx, axis_ratio,
+            )
+            rejected_shape += 1
+            continue
+        if ecc > 0.90:
+            logger.debug(
+                "ROI [%s] circle #%d: eccentricity=%.3f > 0.90 — rejected (too elongated).",
+                roi_label, idx, ecc,
+            )
+            rejected_shape += 1
+            continue
+
         # ---- Compute score ------------------------------------------------
-        area_px  = math.pi * semi_major * semi_minor
-        distance = math.sqrt(
+        area_px    = math.pi * semi_major * semi_minor
+        distance   = math.sqrt(
             (center_x_g - expected_x) ** 2 + (center_y_g - expected_y) ** 2
         )
-        score = area_px - 2.0 * distance
+        shape_score = axis_ratio          # in (0.50, 1]; favours rounder drops
+        score = area_px - 2.0 * distance + 500.0 * shape_score
 
         logger.debug(
             "ROI [%s] circle #%d accepted: "
             "center=(%.1f, %.1f)  major=%.1f  minor=%.1f  "
+            "axis_ratio=%.3f  ecc=%.3f  "
             "area_px=%.1f  dist=%.1f  score=%.2f",
             roi_label, idx,
             center_x_g, center_y_g, major, minor,
+            axis_ratio, ecc,
             area_px, distance, score,
         )
 
@@ -541,8 +564,9 @@ def _detect_drop_in_roi(
     # ------------------------------------------------------------------
     n_passed = len(candidates)
     logger.debug(
-        "ROI [%s]: %d / %d Hough circle(s) passed all filters.",
-        roi_label, n_passed, n_circles,
+        "ROI [%s]: %d / %d Hough circle(s) passed all filters "
+        "(%d rejected by shape).",
+        roi_label, n_passed, n_circles, rejected_shape,
     )
 
     if not candidates:
