@@ -3,23 +3,19 @@ Detection module — Dual pendant-drop detection with spatial classification.
 
 Pipeline overview:
     1. Preprocessing   : Grayscale conversion + CLAHE contrast enhancement +
-                         Gaussian blur.
-    2. Binary masking  : Global Otsu thresholding → inverted binary mask.
-    3. Capillary isolation : Aggressive MORPH_OPEN (elliptical 7×7 kernel,
-                             2 iterations) to visually break the metallic
                          Gaussian blur applied per ROI.
-    2. Hough coarse    : cv2.HoughCircles locates the drop centre and radius
-                         inside each half-frame ROI.
-    3. Dynamic ROI     : A tight crop is built around the Hough circle
-                         (centre ± radius × margin_factor).
-    4. Binary mask     : Otsu thresholding + MORPH_OPEN inside the dynamic ROI
-                         to sever the capillary from the drop body.
-    5. Ellipse fitting : cv2.fitEllipse() on the largest foreground contour
-                         inside the dynamic ROI.
-    6. Global coords   : Ellipse centre and contour are translated back to
+    2. Hough coarse    : cv2.HoughCircles locates drop centre candidates
+                         inside each fixed ROI.
+    3. Candidate scoring : For each Hough circle, a dynamic ROI is cropped,
+                         Otsu + MORPH_OPEN is applied, and an ellipse is fitted.
+                         Candidates are filtered by axis size, centre position,
+                         and ROI-edge proximity.  The surviving candidate with
+                         the highest score (area − 2·distance_to_expected) is
+                         selected.
+    4. Global coords   : Ellipse centre and contour are translated back to
                          full-frame coordinates.
-    7. Spatial rule    : Left ROI → 'control' | Right ROI → 'sample'.
-    8. Physical conv.  : Semi-axes → mm → spheroid geometry (if px_to_mm).
+    5. Spatial rule    : Left ROI → 'control' | Right ROI → 'sample'.
+    6. Physical conv.  : Semi-axes → mm → spheroid geometry (if px_to_mm).
 
 Returns
 -------
@@ -33,6 +29,7 @@ dict[str, BubbleDetection | None]
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import cv2
@@ -289,6 +286,7 @@ def _detect_drop_in_roi(
     x1: int,
     y1: int,
     roi_label: str,
+    frame_h: int,
     blur_kernel: int = 7,
     clip_limit: float = 3.0,
     min_radius: int = 12,
@@ -297,30 +295,41 @@ def _detect_drop_in_roi(
     hough_param1: float = 100.0,
     hough_param2: float = 20.0,
     margin_factor: float = 1.7,
-    min_major: float = 25.0,
-    max_major: float = 180.0,
-    min_minor: float = 18.0,
-    max_minor: float = 160.0,
+    min_major: float = 35.0,
+    max_major: float = 125.0,
+    min_minor: float = 25.0,
+    max_minor: float = 100.0,
 ) -> "tuple[dict, np.ndarray] | None":
     """Detect one pendant drop: Hough coarse localisation + ellipse fine fit.
 
+    All Hough circle candidates are evaluated via ellipse fitting.  Candidates
+    are filtered by:
+        - axis size limits (min/max major & minor),
+        - centre-y position in global frame coordinates,
+        - ellipse proximity to ROI edges.
+
+    The surviving candidate with the highest *score* is selected:
+        score = ellipse_area_px − 2.0 × distance_to_expected_centre
+
+    where expected centre = (mid-x of ROI, y0 + 0.48 × ROI height).
+
     Steps
     -----
-    1. Crop the half-frame ROI from ``frame``.
+    1. Crop the fixed ROI from ``frame``.
     2. Preprocess (grayscale + CLAHE + Gaussian blur).
-    3. Run ``cv2.HoughCircles`` to locate the drop centre and approximate radius.
-    4. Build a tight dynamic crop around the best Hough circle
-       (centre +/- radius x ``margin_factor``).
-    5. Inside that crop: Otsu binary mask + MORPH_OPEN -> largest contour ->
-       ellipse fit.
-    6. Validate ellipse axes against the plausibility limits.
-    7. Translate ellipse centre and contour back to **global** frame coordinates.
+    3. Run ``cv2.HoughCircles`` to locate drop centre candidates.
+    4. For each Hough circle: build a tight dynamic crop, apply Otsu binary
+       mask + MORPH_OPEN, find largest contour, fit ellipse.
+    5. Filter candidates (size, centre position, edge proximity).
+    6. Score and select best candidate.
+    7. Translate ellipse centre and contour back to **global** frame coords.
 
     Args:
         frame         : Full BGR frame (uint8, 3-channel).
-        x0, y0        : Top-left corner of the half-frame ROI (global px).
+        x0, y0        : Top-left corner of the fixed ROI (global px).
         x1, y1        : Bottom-right corner (exclusive) of the ROI (global px).
         roi_label     : Human-readable label for log messages.
+        frame_h       : Full-frame height in pixels (for centre-y checks).
         blur_kernel   : Gaussian kernel size for preprocessing.
         clip_limit    : CLAHE clip limit for preprocessing.
         min_radius    : Minimum Hough circle radius (px).
@@ -336,9 +345,22 @@ def _detect_drop_in_roi(
 
     Returns:
         ``(ellipse_props_global, global_contour)`` on success, or ``None`` if
-        Hough finds no circle or the fitted ellipse fails plausibility checks.
+        Hough finds no valid candidate after filtering and scoring.
     """
-    # 1. Crop half-frame ROI
+    h = frame_h
+
+    # Centre-y acceptance window in global frame coordinates
+    cy_min_global = int(0.06 * h)
+    cy_max_global = int(0.32 * h)
+
+    # Expected drop centre for scoring (global frame coords)
+    expected_x = (x0 + x1) / 2.0
+    expected_y = y0 + 0.48 * (y1 - y0)
+
+    # ROI edge rejection margin (px)
+    _EDGE_MARGIN = 3
+
+    # 1. Crop fixed ROI
     frame_roi = frame[y0:y1, x0:x1]
 
     # 2. Preprocess (grayscale + CLAHE + Gaussian blur)
@@ -361,101 +383,182 @@ def _detect_drop_in_roi(
         return None
 
     circles_round = np.round(circles[0]).astype(int)
-    logger.debug("ROI [%s]: Hough found %d circle(s).", roi_label, len(circles_round))
+    n_circles = len(circles_round)
+    logger.debug("ROI [%s]: Hough found %d circle(s).", roi_label, n_circles)
 
-    # Choose the circle with the largest radius (most likely the drop body)
-    best_circle = max(circles_round, key=lambda c: c[2])
-    hcx, hcy, hr = int(best_circle[0]), int(best_circle[1]), int(best_circle[2])
-    logger.debug(
-        "ROI [%s] Hough selected: local cx=%d cy=%d r=%d",
-        roi_label, hcx, hcy, hr,
-    )
-
-    # 4. Dynamic crop around the Hough circle
-    margin   = int(hr * margin_factor)
     roi_h, roi_w = gray_roi.shape[:2]
 
-    dx0 = max(0, hcx - margin)
-    dy0 = max(0, hcy - margin)
-    dx1 = min(roi_w, hcx + margin)
-    dy1 = min(roi_h, hcy + margin)
+    # ------------------------------------------------------------------
+    # 4–5. Evaluate every Hough candidate
+    # ------------------------------------------------------------------
+    candidates: list[tuple[float, dict, np.ndarray]] = []  # (score, props_global, global_cnt)
 
-    if dx1 <= dx0 or dy1 <= dy0:
-        logger.debug(
-            "ROI [%s]: dynamic crop degenerate (%d,%d)-(%d,%d). Skipping.",
-            roi_label, dx0, dy0, dx1, dy1,
+    for idx, circle in enumerate(circles_round):
+        hcx, hcy, hr = int(circle[0]), int(circle[1]), int(circle[2])
+
+        # 4. Dynamic crop around this Hough circle
+        margin = int(hr * margin_factor)
+        dx0 = max(0, hcx - margin)
+        dy0 = max(0, hcy - margin)
+        dx1 = min(roi_w, hcx + margin)
+        dy1 = min(roi_h, hcy + margin)
+
+        if dx1 <= dx0 or dy1 <= dy0:
+            logger.debug(
+                "ROI [%s] circle #%d: dynamic crop degenerate (%d,%d)-(%d,%d). Skip.",
+                roi_label, idx, dx0, dy0, dx1, dy1,
+            )
+            continue
+
+        gray_dyn = gray_roi[dy0:dy1, dx0:dx1]
+
+        # Binary mask + MORPH_OPEN + largest contour + ellipse fit
+        mask_dyn = _binary_mask(gray_dyn)
+        mask_dyn = _isolate_drops(mask_dyn)
+
+        contours, _ = cv2.findContours(
+            mask_dyn, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        return None
 
-    gray_dyn = gray_roi[dy0:dy1, dx0:dx1]
+        if not contours:
+            logger.debug(
+                "ROI [%s] circle #%d: no contours inside dynamic crop.", roi_label, idx
+            )
+            continue
 
-    # 5. Binary mask + MORPH_OPEN + largest contour + ellipse fit
-    mask_dyn = _binary_mask(gray_dyn)
-    mask_dyn = _isolate_drops(mask_dyn)
+        best_cnt = max(contours, key=cv2.contourArea)
+        props = _fit_single_ellipse(best_cnt)
 
-    contours, _ = cv2.findContours(
-        mask_dyn, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        if props is None:
+            logger.debug(
+                "ROI [%s] circle #%d: contour < 5 pts; ellipse fit skipped.",
+                roi_label, idx,
+            )
+            continue
+
+        # Translate to global frame coords (ROI offset + dynamic-crop offset)
+        gx = x0 + dx0
+        gy = y0 + dy0
+
+        props_g = dict(props)
+        props_g["center_x"] += gx
+        props_g["center_y"] += gy
+        global_cnt = best_cnt + np.array([gx, gy], dtype=np.int32)
+
+        center_x_g = props_g["center_x"]
+        center_y_g = props_g["center_y"]
+        major      = props_g["major_axis"]
+        minor      = props_g["minor_axis"]
+        semi_major = props_g["semi_major"]
+        semi_minor = props_g["semi_minor"]
+
+        # ---- Filter 1: axis size limits -----------------------------------
+        if major < min_major:
+            logger.debug(
+                "ROI [%s] circle #%d: major=%.1f < min %.1f — rejected (too small).",
+                roi_label, idx, major, min_major,
+            )
+            continue
+        if major > max_major:
+            logger.debug(
+                "ROI [%s] circle #%d: major=%.1f > max %.1f — rejected (too large).",
+                roi_label, idx, major, max_major,
+            )
+            continue
+        if minor < min_minor:
+            logger.debug(
+                "ROI [%s] circle #%d: minor=%.1f < min %.1f — rejected (too small).",
+                roi_label, idx, minor, min_minor,
+            )
+            continue
+        if minor > max_minor:
+            logger.debug(
+                "ROI [%s] circle #%d: minor=%.1f > max %.1f — rejected (too large).",
+                roi_label, idx, minor, max_minor,
+            )
+            continue
+
+        # ---- Filter 2: centre-y position in global frame ------------------
+        if center_y_g <= cy_min_global:
+            logger.debug(
+                "ROI [%s] circle #%d: center_y=%.1f <= %d — rejected (too high).",
+                roi_label, idx, center_y_g, cy_min_global,
+            )
+            continue
+        if center_y_g >= cy_max_global:
+            logger.debug(
+                "ROI [%s] circle #%d: center_y=%.1f >= %d — rejected (too low).",
+                roi_label, idx, center_y_g, cy_max_global,
+            )
+            continue
+
+        # ---- Filter 3: ellipse must not be clipped by ROI edges -----------
+        if center_x_g - semi_major < x0 + _EDGE_MARGIN:
+            logger.debug(
+                "ROI [%s] circle #%d: ellipse clips left ROI edge — rejected.",
+                roi_label, idx,
+            )
+            continue
+        if center_x_g + semi_major > x1 - _EDGE_MARGIN:
+            logger.debug(
+                "ROI [%s] circle #%d: ellipse clips right ROI edge — rejected.",
+                roi_label, idx,
+            )
+            continue
+        if center_y_g - semi_minor < y0 + _EDGE_MARGIN:
+            logger.debug(
+                "ROI [%s] circle #%d: ellipse clips top ROI edge — rejected.",
+                roi_label, idx,
+            )
+            continue
+        if center_y_g + semi_minor > y1 - _EDGE_MARGIN:
+            logger.debug(
+                "ROI [%s] circle #%d: ellipse clips bottom ROI edge — rejected.",
+                roi_label, idx,
+            )
+            continue
+
+        # ---- Compute score ------------------------------------------------
+        area_px  = math.pi * semi_major * semi_minor
+        distance = math.sqrt(
+            (center_x_g - expected_x) ** 2 + (center_y_g - expected_y) ** 2
+        )
+        score = area_px - 2.0 * distance
+
+        logger.debug(
+            "ROI [%s] circle #%d accepted: "
+            "center=(%.1f, %.1f)  major=%.1f  minor=%.1f  "
+            "area_px=%.1f  dist=%.1f  score=%.2f",
+            roi_label, idx,
+            center_x_g, center_y_g, major, minor,
+            area_px, distance, score,
+        )
+
+        candidates.append((score, props_g, global_cnt))
+
+    # ------------------------------------------------------------------
+    # 6. Select best candidate
+    # ------------------------------------------------------------------
+    n_passed = len(candidates)
+    logger.debug(
+        "ROI [%s]: %d / %d Hough circle(s) passed all filters.",
+        roi_label, n_passed, n_circles,
     )
 
-    if not contours:
-        logger.debug("ROI [%s]: no contours inside dynamic crop.", roi_label)
+    if not candidates:
         return None
 
-    best_cnt = max(contours, key=cv2.contourArea)
-    props    = _fit_single_ellipse(best_cnt)
-
-    if props is None:
-        logger.debug(
-            "ROI [%s]: largest contour < 5 points; ellipse fit skipped.", roi_label
-        )
-        return None
-
-    # 6. Plausibility check on ellipse axes
-    major = props["major_axis"]
-    minor = props["minor_axis"]
-
-    if major < min_major:
-        logger.debug(
-            "ROI [%s]: major=%.1f px < min %.1f px -- rejected (reflection/noise).",
-            roi_label, major, min_major,
-        )
-        return None
-    if major > max_major:
-        logger.debug(
-            "ROI [%s]: major=%.1f px > max %.1f px -- rejected (background).",
-            roi_label, major, max_major,
-        )
-        return None
-    if minor < min_minor:
-        logger.debug(
-            "ROI [%s]: minor=%.1f px < min %.1f px -- rejected (reflection/noise).",
-            roi_label, minor, min_minor,
-        )
-        return None
-    if minor > max_minor:
-        logger.debug(
-            "ROI [%s]: minor=%.1f px > max %.1f px -- rejected (background).",
-            roi_label, minor, max_minor,
-        )
-        return None
-
-    # 7. Translate to global frame coordinates
-    #    dynamic crop offset within ROI: (dx0, dy0)
-    #    ROI offset within frame:        (x0,  y0)
-    gx = x0 + dx0
-    gy = y0 + dy0
-
-    props = dict(props)   # mutable copy
-    props["center_x"] += gx
-    props["center_y"] += gy
-
-    global_cnt = best_cnt + np.array([gx, gy], dtype=np.int32)
+    best_score, best_props, best_cnt_global = max(candidates, key=lambda t: t[0])
 
     logger.debug(
-        "ROI [%s] ellipse accepted: center=(%.1f, %.1f)  major=%.1f  minor=%.1f",
-        roi_label, props["center_x"], props["center_y"], major, minor,
+        "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f",
+        roi_label,
+        best_props["center_x"], best_props["center_y"],
+        best_props["major_axis"], best_props["minor_axis"],
+        best_score,
     )
-    return props, global_cnt
+
+    return best_props, best_cnt_global
 
 
 
@@ -473,16 +576,17 @@ def detect_bubbles(
 
     Full pipeline
     -------------
-    1. Two fixed half-frame ROIs are defined (left -> control, right -> sample).
-    2. Inside each ROI: preprocess -> Hough coarse localisation -> dynamic crop
-       -> Otsu + MORPH_OPEN -> largest contour -> ellipse fit -> axis check.
+    1. Two fixed, tightened ROIs are defined (left → control, right → sample).
+    2. Inside each ROI: preprocess → Hough coarse localisation → per-candidate
+       dynamic crop → Otsu + MORPH_OPEN → largest contour → ellipse fit →
+       axis / position / edge checks → scored selection.
     3. Ellipse centre and contour are translated back to global frame coords.
     4. _build_detection populates a BubbleDetection with optional mm conversion.
 
     Spatial rule (unbreakable)
     --------------------------
-    * Left  ROI (x: 0-48 % of frame width)   -> label = 'control'
-    * Right ROI (x: 52-100 % of frame width)  -> label = 'sample'
+    * Left  ROI (x: 8–42 % of frame width,  y: 0–36 %)  → label = 'control'
+    * Right ROI (x: 46–78 % of frame width, y: 0–36 %)  → label = 'sample'
 
     Args:
         frame      : BGR colour image from the microscope (uint8, 3-channel).
@@ -515,29 +619,31 @@ def detect_bubbles(
     _HOUGH_PARAM1:  float = 100.0
     _HOUGH_PARAM2:  float = 20.0
     _MARGIN_FACTOR: float = 1.7
-    _MIN_MAJOR:     float = 25.0
-    _MAX_MAJOR:     float = 180.0
-    _MIN_MINOR:     float = 18.0
-    _MAX_MINOR:     float = 160.0
+    _MIN_MAJOR:     float = 35.0
+    _MAX_MAJOR:     float = 125.0
+    _MIN_MINOR:     float = 25.0
+    _MAX_MINOR:     float = 100.0
 
     # ------------------------------------------------------------------
-    # Fixed half-frame ROIs
+    # Fixed ROIs — tightened to avoid background false positives
     # ------------------------------------------------------------------
     # CONTROL drop — left capillary
-    c_x0 = int(0.00 * w);  c_x1 = int(0.48 * w)
-    c_y0 = int(0.00 * h);  c_y1 = int(0.50 * h)
+    c_x0 = int(0.08 * w);  c_x1 = int(0.42 * w)
+    c_y0 = int(0.00 * h);  c_y1 = int(0.36 * h)
 
-    # SAMPLE drop — right capillary
-    s_x0 = int(0.52 * w);  s_x1 = int(1.00 * w)
-    s_y0 = int(0.00 * h);  s_y1 = int(0.50 * h)
+    # SAMPLE drop — right capillary (right edge pulled in to 78 % to avoid
+    # spurious detections in the far upper-right corner of the frame)
+    s_x0 = int(0.46 * w);  s_x1 = int(0.78 * w)
+    s_y0 = int(0.00 * h);  s_y1 = int(0.36 * h)
 
     # ------------------------------------------------------------------
-    # Step 4 — Hough + ellipse detection per ROI
+    # Hough + ellipse detection per ROI
     # ------------------------------------------------------------------
     control_result = _detect_drop_in_roi(
         frame,
         c_x0, c_y0, c_x1, c_y1,
         roi_label="control",
+        frame_h=h,
         blur_kernel=blur_kernel,
         clip_limit=clip_limit,
         min_radius=_MIN_RADIUS,
@@ -556,6 +662,7 @@ def detect_bubbles(
         frame,
         s_x0, s_y0, s_x1, s_y1,
         roi_label="sample",
+        frame_h=h,
         blur_kernel=blur_kernel,
         clip_limit=clip_limit,
         min_radius=_MIN_RADIUS,
@@ -572,15 +679,17 @@ def detect_bubbles(
 
     if control_result is None:
         logger.error(
-            "ROI [control]: detection failed (Hough found no circle or ellipse "
-            "rejected). Verify ROI bounds, Hough parameters, or size thresholds."
+            "ROI [control]: detection failed — no Hough circle survived the "
+            "size / position / edge filters. "
+            "Check ROI bounds, Hough parameters, or size thresholds."
         )
         return None
 
     if sample_result is None:
         logger.error(
-            "ROI [sample]: detection failed (Hough found no circle or ellipse "
-            "rejected). Verify ROI bounds, Hough parameters, or size thresholds."
+            "ROI [sample]: detection failed — no Hough circle survived the "
+            "size / position / edge filters. "
+            "Check ROI bounds, Hough parameters, or size thresholds."
         )
         return None
 
@@ -588,10 +697,10 @@ def detect_bubbles(
     right_props, right_cnt = sample_result
 
     # ------------------------------------------------------------------
-    # Step 5 — Spatial classification (unbreakable rule)
+    # Spatial classification (unbreakable rule)
     #
-    #   left  ROI -> label = 'control'
-    #   right ROI -> label = 'sample'
+    #   left  ROI → label = 'control'
+    #   right ROI → label = 'sample'
     # ------------------------------------------------------------------
     logger.debug(
         "Spatial classification: control centroid_x=%.1f | sample centroid_x=%.1f",
@@ -600,7 +709,7 @@ def detect_bubbles(
     )
 
     # ------------------------------------------------------------------
-    # Step 6 — Build BubbleDetection objects with physical conversion
+    # Build BubbleDetection objects with physical conversion
     # ------------------------------------------------------------------
     detection_control = _build_detection(
         left_props,  left_cnt,  px_to_mm, label="control"
