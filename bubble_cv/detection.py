@@ -241,7 +241,7 @@ def _build_detection(
     """
     result = BubbleDetection()
     result.label = label
-    result.method = "hough+morphopen+ellipse"
+    result.method = "hough+adaptive+close+ellipse"
     result.confidence = 1.0
     result.contour = contour
 
@@ -412,13 +412,56 @@ def _detect_drop_in_roi(
             continue
 
         gray_dyn = gray_roi[dy0:dy1, dx0:dx1]
+        dyn_h, dyn_w = gray_dyn.shape[:2]
 
-        # Binary mask + MORPH_OPEN + largest contour + ellipse fit
-        mask_dyn = _binary_mask(gray_dyn)
-        mask_dyn = _isolate_drops(mask_dyn)
+        # ---- Fine segmentation: adaptiveThreshold + MORPH_CLOSE -----------
+        # block_size must be odd, >= 3, and smaller than both dyn dims
+        block_size = max(11, (hr // 5) | 1)
+        max_valid_block = min(dyn_h, dyn_w)
+        if max_valid_block < 3:
+            logger.debug(
+                "ROI [%s] circle #%d: dynamic crop too small (%dx%d) for "
+                "adaptiveThreshold — skipping.",
+                roi_label, idx, dyn_w, dyn_h,
+            )
+            continue
+        # Ensure block_size is odd and fits in the crop
+        if block_size >= max_valid_block:
+            block_size = max_valid_block if max_valid_block % 2 == 1 else max_valid_block - 1
+        if block_size < 3:
+            logger.debug(
+                "ROI [%s] circle #%d: block_size=%d too small — skipping.",
+                roi_label, idx, block_size,
+            )
+            continue
+
+        mask_dyn = cv2.adaptiveThreshold(
+            gray_dyn,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=block_size,
+            C=5,
+        )
+        logger.debug(
+            "ROI [%s] circle #%d: segmentation=adaptive+close  block_size=%d",
+            roi_label, idx, block_size,
+        )
+
+        close_kernel = np.ones((5, 5), np.uint8)
+        mask_dyn = cv2.morphologyEx(
+            mask_dyn,
+            cv2.MORPH_CLOSE,
+            close_kernel,
+            iterations=1,
+        )
 
         contours, _ = cv2.findContours(
             mask_dyn, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        logger.debug(
+            "ROI [%s] circle #%d: %d contour(s) found in dynamic crop.",
+            roi_label, idx, len(contours),
         )
 
         if not contours:
