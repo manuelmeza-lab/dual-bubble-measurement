@@ -523,17 +523,19 @@ def _detect_drop_in_roi(
         axis_ratio  = minor / major          # in (0, 1]; closer to 1 = rounder
         ecc         = props_g["eccentricity"]
 
-        if axis_ratio < 0.50:
+        if axis_ratio < 0.65:
             logger.debug(
-                "ROI [%s] circle #%d: axis_ratio=%.3f < 0.50 — rejected (too elongated).",
-                roi_label, idx, axis_ratio,
+                "ROI [%s] circle #%d: major=%.1f minor=%.1f "
+                "axis_ratio=%.3f < 0.65  ecc=%.3f — rejected (shape).",
+                roi_label, idx, major, minor, axis_ratio, ecc,
             )
             rejected_shape += 1
             continue
-        if ecc > 0.90:
+        if ecc > 0.78:
             logger.debug(
-                "ROI [%s] circle #%d: eccentricity=%.3f > 0.90 — rejected (too elongated).",
-                roi_label, idx, ecc,
+                "ROI [%s] circle #%d: major=%.1f minor=%.1f "
+                "axis_ratio=%.3f  ecc=%.3f > 0.78 — rejected (shape).",
+                roi_label, idx, major, minor, axis_ratio, ecc,
             )
             rejected_shape += 1
             continue
