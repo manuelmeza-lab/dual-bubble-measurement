@@ -241,7 +241,7 @@ def _build_detection(
     """
     result = BubbleDetection()
     result.label = label
-    result.method = "hough+adaptive+close+ellipse"
+    result.method = "hough+adaptive+close+bodyellipse"
     result.confidence = 1.0
     result.contour = contour
 
@@ -466,16 +466,101 @@ def _detect_drop_in_roi(
 
         if not contours:
             logger.debug(
-                "ROI [%s] circle #%d: no contours inside dynamic crop.", roi_label, idx
+                "ROI [%s] circle #%d: no contours inside dynamic crop — skipping.",
+                roi_label, idx,
             )
             continue
 
-        best_cnt = max(contours, key=cv2.contourArea)
+        # ---- Isolate largest connected component (drop body candidate) ----
+        drop_cnt = max(contours, key=cv2.contourArea)
+
+        # Build a single-component mask for width-profile analysis
+        comp_mask = np.zeros_like(mask_dyn)
+        cv2.drawContours(comp_mask, [drop_cnt], -1, 255, thickness=cv2.FILLED)
+
+        # ---- Width-profile: per-row foreground extent ---------------------
+        comp_h, comp_w = comp_mask.shape[:2]
+        row_widths: list[int] = []
+        for row_y in range(comp_h):
+            row = comp_mask[row_y]
+            fg_cols = np.where(row > 0)[0]
+            row_widths.append(int(fg_cols[-1] - fg_cols[0] + 1) if len(fg_cols) >= 2 else 0)
+
+        body_max_width = max(row_widths) if row_widths else 0
+
+        if body_max_width < 5:
+            logger.debug(
+                "ROI [%s] circle #%d: body_max_width=%d too narrow — skipping.",
+                roi_label, idx, body_max_width,
+            )
+            continue
+
+        # ---- Find body_start_y: first row >= 50 % of body_max_width -------
+        # sustained for at least 3 consecutive rows
+        _BODY_FRAC     = 0.50
+        _MIN_RUN       = 3
+        width_thresh   = _BODY_FRAC * body_max_width
+        body_start_y: int | None = None
+        run_start: int | None = None
+        run_len: int = 0
+
+        for row_y, w in enumerate(row_widths):
+            if w >= width_thresh:
+                if run_start is None:
+                    run_start = row_y
+                    run_len = 1
+                else:
+                    run_len += 1
+                if run_len >= _MIN_RUN:
+                    body_start_y = run_start
+                    break
+            else:
+                run_start = None
+                run_len = 0
+
+        if body_start_y is None:
+            logger.debug(
+                "ROI [%s] circle #%d: could not find body_start_y "
+                "(body_max_width=%d, thresh=%.1f) — skipping.",
+                roi_label, idx, body_max_width, width_thresh,
+            )
+            continue
+
+        # Global y of the body cut (for logging)
+        body_start_y_global = y0 + dy0 + body_start_y
+
+        logger.debug(
+            "ROI [%s] circle #%d: body_max_width=%d  body_start_y(local)=%d  "
+            "body_start_y(global)=%d",
+            roi_label, idx, body_max_width, body_start_y, body_start_y_global,
+        )
+
+        # ---- Body mask: keep only rows >= body_start_y --------------------
+        body_mask = comp_mask.copy()
+        body_mask[:body_start_y, :] = 0
+
+        body_contours, _ = cv2.findContours(
+            body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not body_contours:
+            logger.debug(
+                "ROI [%s] circle #%d: no contours in body_mask — skipping.",
+                roi_label, idx,
+            )
+            continue
+
+        best_cnt = max(body_contours, key=cv2.contourArea)
+        logger.debug(
+            "ROI [%s] circle #%d: body contour has %d points.",
+            roi_label, idx, len(best_cnt),
+        )
+
         props = _fit_single_ellipse(best_cnt)
 
         if props is None:
             logger.debug(
-                "ROI [%s] circle #%d: contour < 5 pts; ellipse fit skipped.",
+                "ROI [%s] circle #%d: body contour < 5 pts; ellipse fit skipped.",
                 roi_label, idx,
             )
             continue
