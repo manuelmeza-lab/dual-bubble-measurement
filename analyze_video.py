@@ -292,6 +292,42 @@ def _linear_fit(
 
 
 # ---------------------------------------------------------------------------
+# Bodyellipse audit summary
+# ---------------------------------------------------------------------------
+
+def _print_bodyellipse_audit(records: list[dict]) -> None:
+    """Print a per-side bodyellipse usage summary to the logger."""
+    from collections import Counter
+
+    logger.info("=" * 64)
+    logger.info("BODYELLIPSE AUDIT")
+    for side in ("control", "sample"):
+        side_recs = [r for r in records if r["roi_label"] == side]
+        total = len(side_recs)
+        if total == 0:
+            logger.info("%s:  no records collected.", side.upper())
+            continue
+        used     = sum(1 for r in side_recs if r["bodyellipse_used"])
+        not_used = total - used
+        pct_used = used / total * 100.0
+        reasons  = Counter(
+            r["bodyellipse_failure_reason"]
+            for r in side_recs
+            if not r["bodyellipse_used"]
+        )
+        logger.info("%s:", side.upper())
+        logger.info("    total frames processed:   %d", total)
+        logger.info("    bodyellipse used:          %d  (%.1f%%)", used, pct_used)
+        logger.info("    fallback/non-bodyellipse:  %d  (%.1f%%)",
+                    not_used, 100.0 - pct_used)
+        if reasons:
+            logger.info("    failure reasons:")
+            for reason, count in reasons.most_common():
+                logger.info("        %-38s %d", reason + ":", count)
+    logger.info("=" * 64)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -337,8 +373,9 @@ def main() -> int:
 
     # ── Paso 3: Iteración y detección dual cuadro a cuadro ───────────────
     results: list[dict] = []
-    processed = 0   # Fotogramas con detección exitosa de AMBAS gotas
-    failed = 0      # Fotogramas donde la detección dual falló
+    processed = 0        # Fotogramas con detección exitosa de AMBAS gotas
+    failed = 0           # Fotogramas donde la detección dual falló
+    _audit_records: list[dict] = []   # Diagnóstico bodyellipse acumulado
 
     logger.info(
         "Processing video: %s (fps=%.1f, skip=%d)",
@@ -355,7 +392,13 @@ def main() -> int:
             clip_limit=args.clip_limit,
         )
 
-        if dual is None:
+        # Accumulate bodyellipse audit (always, even when detection fails)
+        for _side in LABELS:
+            _ad = dict(dual["_audit"][_side])
+            _ad["frame_id"] = frame_num
+            _audit_records.append(_ad)
+
+        if dual["control"] is None or dual["sample"] is None:
             logger.debug("Frame %d: dual detection failed.", frame_num)
             failed += 1
             continue
@@ -388,7 +431,10 @@ def main() -> int:
             vis_path = Path(args.vis_dir) / f"frame_{frame_num:06d}.png"
             save_annotated_frame_dual(frame, ctrl_det, samp_det, vis_path)
 
-    # ── Paso 4: Finalizar si no hubo detecciones ─────────────────────────
+    # ── Diagnóstico bodyellipse ──────────────────────────────────────
+    _print_bodyellipse_audit(_audit_records)
+
+    # ── Paso 4: Finalizar si no hubo detecciones ─────────────────────
     if not results:
         logger.error("No dual-drop detections in the entire video.")
         return 1

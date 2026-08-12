@@ -299,7 +299,7 @@ def _detect_drop_in_roi(
     max_major: float = 125.0,
     min_minor: float = 25.0,
     max_minor: float = 100.0,
-) -> "tuple[dict, np.ndarray] | None":
+) -> "tuple[tuple[dict, np.ndarray], dict] | tuple[None, dict]":
     """Detect one pendant drop: Hough coarse localisation + ellipse fine fit.
 
     All Hough circle candidates are evaluated via ellipse fitting.  Candidates
@@ -344,8 +344,12 @@ def _detect_drop_in_roi(
         max_minor     : Maximum accepted minor axis of the fitted ellipse (px).
 
     Returns:
-        ``(ellipse_props_global, global_contour)`` on success, or ``None`` if
-        Hough finds no valid candidate after filtering and scoring.
+        ``((ellipse_props_global, global_contour), diag)`` on success.
+        ``(None, diag)`` when no valid candidate survives.
+        ``diag`` is always present and contains bodyellipse audit fields:
+        ``roi_label``, ``bodyellipse_used``, ``bodyellipse_failure_reason``,
+        ``body_max_width``, ``body_start_y_local``, ``body_start_y_global``,
+        ``n_contour_points``, ``method_final``.
     """
     h = frame_h
 
@@ -378,9 +382,25 @@ def _detect_drop_in_roi(
         maxRadius=max_radius,
     )
 
+    # ------------------------------------------------------------------
+    # Diagnostic dict — updated at each bodyellipse stage; returned always
+    # ------------------------------------------------------------------
+    _best_diag: dict = {
+        "roi_label":                  roi_label,
+        "bodyellipse_used":           False,
+        "bodyellipse_failure_reason": "no_candidates",
+        "body_max_width":             None,
+        "body_start_y_local":         None,
+        "body_start_y_global":        None,
+        "n_contour_points":           None,
+        "method_final":               "",
+    }
+    _best_diag_level: int = -1   # tracks deepest bodyellipse stage reached
+
     if circles is None:
         logger.debug("ROI [%s]: Hough found 0 circles. Detection failed.", roi_label)
-        return None
+        _best_diag["bodyellipse_failure_reason"] = "hough_no_circles"
+        return None, _best_diag
 
     circles_round = np.round(circles[0]).astype(int)
     n_circles = len(circles_round)
@@ -493,6 +513,12 @@ def _detect_drop_in_roi(
                 "ROI [%s] circle #%d: body_max_width=%d too narrow — skipping.",
                 roi_label, idx, body_max_width,
             )
+            if _best_diag_level < 1:
+                _best_diag.update({
+                    "bodyellipse_failure_reason": "body_max_width_lt5",
+                    "body_max_width": body_max_width,
+                })
+                _best_diag_level = 1
             continue
 
         # ---- Find body_start_y: first row >= 50 % of body_max_width -------
@@ -524,6 +550,12 @@ def _detect_drop_in_roi(
                 "(body_max_width=%d, thresh=%.1f) — skipping.",
                 roi_label, idx, body_max_width, width_thresh,
             )
+            if _best_diag_level < 2:
+                _best_diag.update({
+                    "bodyellipse_failure_reason": "body_start_not_found",
+                    "body_max_width": body_max_width,
+                })
+                _best_diag_level = 2
             continue
 
         # Global y of the body cut (for logging)
@@ -548,6 +580,14 @@ def _detect_drop_in_roi(
                 "ROI [%s] circle #%d: no contours in body_mask — skipping.",
                 roi_label, idx,
             )
+            if _best_diag_level < 3:
+                _best_diag.update({
+                    "bodyellipse_failure_reason": "body_contour_missing",
+                    "body_max_width": body_max_width,
+                    "body_start_y_local": body_start_y,
+                    "body_start_y_global": body_start_y_global,
+                })
+                _best_diag_level = 3
             continue
 
         best_cnt = max(body_contours, key=cv2.contourArea)
@@ -563,7 +603,27 @@ def _detect_drop_in_roi(
                 "ROI [%s] circle #%d: body contour < 5 pts; ellipse fit skipped.",
                 roi_label, idx,
             )
+            if _best_diag_level < 4:
+                _best_diag.update({
+                    "bodyellipse_failure_reason": "body_contour_lt_5_points",
+                    "body_max_width": body_max_width,
+                    "body_start_y_local": body_start_y,
+                    "body_start_y_global": body_start_y_global,
+                    "n_contour_points": len(best_cnt),
+                })
+                _best_diag_level = 4
             continue
+
+        # Bodyellipse succeeded for this candidate — record deepest stage
+        if _best_diag_level < 5:
+            _best_diag.update({
+                "bodyellipse_failure_reason": "",
+                "body_max_width": body_max_width,
+                "body_start_y_local": body_start_y,
+                "body_start_y_global": body_start_y_global,
+                "n_contour_points": len(best_cnt),
+            })
+            _best_diag_level = 5
 
         # Translate to global frame coords (ROI offset + dynamic-crop offset)
         gx = x0 + dx0
@@ -700,7 +760,11 @@ def _detect_drop_in_roi(
     )
 
     if not candidates:
-        return None
+        # Bodyellipse succeeded internally but every candidate was rejected
+        # by the geometric filters (axis size / centre-y / edge / shape).
+        if _best_diag_level == 5:
+            _best_diag["bodyellipse_failure_reason"] = "geometry_filter_rejected"
+        return None, _best_diag
 
     best_score, best_props, best_cnt_global = max(candidates, key=lambda t: t[0])
 
@@ -712,7 +776,10 @@ def _detect_drop_in_roi(
         best_score,
     )
 
-    return best_props, best_cnt_global
+    # Winning candidate used bodyellipse successfully
+    _best_diag["bodyellipse_used"] = True
+    _best_diag["method_final"] = "hough+adaptive+close+bodyellipse"
+    return (best_props, best_cnt_global), _best_diag
 
 
 
@@ -725,7 +792,7 @@ def detect_bubbles(
     px_to_mm: float | None = None,
     blur_kernel: int = 7,
     clip_limit: float = 3.0,
-) -> dict[str, BubbleDetection | None] | None:
+) -> dict[str, "BubbleDetection | None | dict"]:
     """Detect two simultaneous pendant drops and classify them spatially.
 
     Full pipeline
@@ -750,9 +817,12 @@ def detect_bubbles(
         clip_limit : CLAHE clip limit for contrast enhancement.
 
     Returns:
-        ``{'control': BubbleDetection, 'sample': BubbleDetection}``
+        ``{'control': BubbleDetection | None,
+           'sample': BubbleDetection | None,
+           '_audit': {'control': diag, 'sample': diag}}``
 
-        Returns ``None`` if either ROI fails to produce a valid detection.
+        ``'control'`` / ``'sample'`` is ``None`` when that ROI fails.
+        ``'_audit'`` is always present with per-side bodyellipse diagnostics.
 
     Raises:
         ValueError: If ``frame`` is not a 3-channel BGR image.
@@ -793,7 +863,7 @@ def detect_bubbles(
     # ------------------------------------------------------------------
     # Hough + ellipse detection per ROI
     # ------------------------------------------------------------------
-    control_result = _detect_drop_in_roi(
+    control_result, ctrl_diag = _detect_drop_in_roi(
         frame,
         c_x0, c_y0, c_x1, c_y1,
         roi_label="control",
@@ -812,7 +882,7 @@ def detect_bubbles(
         max_minor=_MAX_MINOR,
     )
 
-    sample_result = _detect_drop_in_roi(
+    sample_result, samp_diag = _detect_drop_in_roi(
         frame,
         s_x0, s_y0, s_x1, s_y1,
         roi_label="sample",
@@ -831,13 +901,15 @@ def detect_bubbles(
         max_minor=_MAX_MINOR,
     )
 
+    _audit = {"control": ctrl_diag, "sample": samp_diag}
+
     if control_result is None:
         logger.error(
             "ROI [control]: detection failed — no Hough circle survived the "
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return None
+        return {"control": None, "sample": None, "_audit": _audit}
 
     if sample_result is None:
         logger.error(
@@ -845,7 +917,7 @@ def detect_bubbles(
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return None
+        return {"control": None, "sample": None, "_audit": _audit}
 
     left_props,  left_cnt  = control_result
     right_props, right_cnt = sample_result
@@ -875,6 +947,7 @@ def detect_bubbles(
     return {
         "control": detection_control,
         "sample":  detection_sample,
+        "_audit":  _audit,
     }
 
 # ---------------------------------------------------------------------------
