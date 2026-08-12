@@ -159,8 +159,8 @@ def draw_detection_dual(
     consistent with the single-drop convention.  The text blocks are
     spatially separated to avoid overlap:
 
-    * **[CONTROL]** block → anchored to the **upper-left** corner.
-    * **[MUESTRA]**  block → anchored to the **upper-right** corner
+    * **[CONTROL]** block → anchored to the **lower-left** corner.
+    * **[MUESTRA]**  block → anchored to the **lower-right** corner
       (right-aligned so it never spills off-screen).
 
     Each ellipse is drawn with:
@@ -244,8 +244,11 @@ def draw_detection_dual(
         lines: list[str],
         color_fg: tuple[int, int, int],
     ) -> None:
-        """Render lines left-aligned from the top-left corner."""
-        y = _MARGIN + 18   # first baseline
+        """Render lines left-aligned from the bottom-left corner."""
+        # Pre-compute total block height to anchor from the bottom
+        sizes = [cv2.getTextSize(l, _FONT, _FONT_SCALE, _FONT_THICK)[0] for l in lines]
+        total_h = sum(th + _LINE_PAD for (_, th) in sizes)
+        y = img_h - _MARGIN - total_h + sizes[0][1]   # first baseline
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, _FONT, _FONT_SCALE, _FONT_THICK)
             x0, y0 = _MARGIN, y - th - 3
@@ -268,8 +271,11 @@ def draw_detection_dual(
         lines: list[str],
         color_fg: tuple[int, int, int],
     ) -> None:
-        """Render lines right-aligned from the top-right corner."""
-        y = _MARGIN + 18
+        """Render lines right-aligned from the bottom-right corner."""
+        # Pre-compute total block height to anchor from the bottom
+        sizes = [cv2.getTextSize(l, _FONT, _FONT_SCALE, _FONT_THICK)[0] for l in lines]
+        total_h = sum(th + _LINE_PAD for (_, th) in sizes)
+        y = img_h - _MARGIN - total_h + sizes[0][1]   # first baseline
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, _FONT, _FONT_SCALE, _FONT_THICK)
             # Right edge: img_w - _MARGIN; text starts at img_w - _MARGIN - tw
