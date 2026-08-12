@@ -328,6 +328,61 @@ def _print_bodyellipse_audit(records: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bodyellipse fit-quality audit summary
+# ---------------------------------------------------------------------------
+
+def _print_fit_quality_audit(df: pd.DataFrame) -> None:
+    """Print per-side bodyellipse fit quality summary to the logger."""
+    logger.info("=" * 64)
+    logger.info("BODYELLIPSE FIT QUALITY AUDIT")
+    for side in ("control", "sample"):
+        iou_col  = f"{side}_bodyellipse_iou"
+        rmse_col = f"{side}_bodyellipse_residual_rmse"
+        p95_col  = f"{side}_bodyellipse_residual_p95"
+        ar_col   = f"{side}_bodyellipse_area_ratio"
+        maj_col  = f"{side}_major_axis_px"
+        min_col  = f"{side}_minor_axis_px"
+
+        if iou_col not in df.columns or df[iou_col].isna().all():
+            logger.info("%s: no fit-quality data.", side.upper())
+            continue
+
+        d = df[[iou_col, rmse_col, p95_col, ar_col]].dropna()
+        n = len(d)
+        logger.info("%s  (n=%d):", side.upper(), n)
+        logger.info(
+            "    IoU:            mean=%.4f  median=%.4f  SD=%.4f",
+            d[iou_col].mean(), d[iou_col].median(), d[iou_col].std(),
+        )
+        logger.info(
+            "    residual RMSE:  mean=%.4f  median=%.4f  SD=%.4f",
+            d[rmse_col].mean(), d[rmse_col].median(), d[rmse_col].std(),
+        )
+        logger.info("    residual P95:   mean=%.4f", d[p95_col].mean())
+        logger.info(
+            "    area ratio:     mean=%.4f  SD=%.4f",
+            d[ar_col].mean(), d[ar_col].std(),
+        )
+
+        # 5 frames with worst (lowest) IoU
+        df_q = df[df[iou_col].notna()]
+        worst5 = df_q.nsmallest(5, iou_col)
+        logger.info("    5 worst IoU frames:")
+        for _, row in worst5.iterrows():
+            logger.info(
+                "        frame=%6d  t=%7.1fs  IoU=%.4f  "
+                "rmse=%.4f  major=%.1f  minor=%.1f",
+                int(row.get("frame_id", -1)),
+                float(row.get("timestamp_s", 0.0)),
+                float(row[iou_col]),
+                float(row[rmse_col]) if pd.notna(row[rmse_col]) else float("nan"),
+                float(row[maj_col])  if maj_col in row and pd.notna(row[maj_col])  else float("nan"),
+                float(row[min_col])  if min_col in row and pd.notna(row[min_col])  else float("nan"),
+            )
+    logger.info("=" * 64)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -441,6 +496,9 @@ def main() -> int:
 
     # ── Paso 5: Construir DataFrame ───────────────────────────────────────
     df = pd.DataFrame(results)
+
+    # ── Calidad del ajuste bodyellipse ────────────────────────────────────
+    _print_fit_quality_audit(df)
 
     # ── Paso 6: Suavizado temporal ────────────────────────────────────────
     if args.smooth > 1:

@@ -96,6 +96,16 @@ class BubbleDetection:
     # ---- Spatial label (set by detect_bubbles) ----------------------------
     label: str = ""          # 'control' or 'sample'
 
+    # ---- Bodyellipse fit quality (diagnostic only — never used in detection) ----
+    bodyellipse_fit_point_count:  int   | None = None
+    bodyellipse_contour_area_px2: float | None = None
+    bodyellipse_ellipse_area_px2: float | None = None
+    bodyellipse_area_ratio:       float | None = None
+    bodyellipse_iou:              float | None = None
+    bodyellipse_residual_mean:    float | None = None
+    bodyellipse_residual_rmse:    float | None = None
+    bodyellipse_residual_p95:     float | None = None
+
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
         return {
@@ -119,6 +129,15 @@ class BubbleDetection:
             "rejection_reason": self.rejection_reason,
             "confidence": round(self.confidence, 4),
             "method": self.method,
+            # ---- Bodyellipse fit quality (diagnostic) ----------------------
+            "bodyellipse_fit_point_count":  self.bodyellipse_fit_point_count,
+            "bodyellipse_contour_area_px2": round(self.bodyellipse_contour_area_px2, 2) if self.bodyellipse_contour_area_px2 is not None else None,
+            "bodyellipse_ellipse_area_px2": round(self.bodyellipse_ellipse_area_px2, 2) if self.bodyellipse_ellipse_area_px2 is not None else None,
+            "bodyellipse_area_ratio":       round(self.bodyellipse_area_ratio,       4) if self.bodyellipse_area_ratio       is not None else None,
+            "bodyellipse_iou":              round(self.bodyellipse_iou,              4) if self.bodyellipse_iou              is not None else None,
+            "bodyellipse_residual_mean":    round(self.bodyellipse_residual_mean,    4) if self.bodyellipse_residual_mean    is not None else None,
+            "bodyellipse_residual_rmse":    round(self.bodyellipse_residual_rmse,    4) if self.bodyellipse_residual_rmse    is not None else None,
+            "bodyellipse_residual_p95":     round(self.bodyellipse_residual_p95,     4) if self.bodyellipse_residual_p95     is not None else None,
         }
 
 
@@ -276,6 +295,101 @@ def _build_detection(
 
 
 # ---------------------------------------------------------------------------
+# Bodyellipse fit-quality helper (pure diagnostic — never called in filters)
+# ---------------------------------------------------------------------------
+
+def _compute_ellipse_fit_quality(
+    best_cnt: np.ndarray,
+    props: dict,
+    dyn_h: int,
+    dyn_w: int,
+) -> dict:
+    """Compute diagnostic fit-quality metrics between a contour and its fitted ellipse.
+
+    All quantities are dimensionless or in pixel units of the local dynamic crop.
+    This function is called AFTER the winning candidate is selected and its results
+    are never used for detection, filtering, scoring, or measurement.
+
+    Args:
+        best_cnt : Body contour in dynamic-crop coordinates (shape (N, 1, 2)).
+        props    : Output of ``_fit_single_ellipse``, same coordinate system.
+        dyn_h    : Height of the dynamic-crop canvas.
+        dyn_w    : Width  of the dynamic-crop canvas.
+
+    Returns:
+        Dictionary with keys: fit_point_count, contour_area_px2,
+        ellipse_area_px2, area_ratio, iou, residual_mean, residual_rmse,
+        residual_p95.  Any field that cannot be computed is ``None``.
+    """
+    result: dict = {
+        "fit_point_count":    len(best_cnt),
+        "contour_area_px2":   None,
+        "ellipse_area_px2":   None,
+        "area_ratio":         None,
+        "iou":                None,
+        "residual_mean":      None,
+        "residual_rmse":      None,
+        "residual_p95":       None,
+    }
+    try:
+        contour_area = float(cv2.contourArea(best_cnt))
+        semi_major   = props["semi_major"]
+        semi_minor   = props["semi_minor"]
+        ellipse_area = math.pi * semi_major * semi_minor
+
+        result["contour_area_px2"] = contour_area
+        result["ellipse_area_px2"] = ellipse_area
+        if contour_area > 0:
+            result["area_ratio"] = ellipse_area / contour_area
+
+        cx_loc    = props["center_x"]
+        cy_loc    = props["center_y"]
+        angle_deg = props["angle_deg"]
+
+        # ---- IoU: rasterise contour and ellipse on the local crop canvas ----
+        cnt_mask = np.zeros((dyn_h, dyn_w), np.uint8)
+        cv2.drawContours(cnt_mask, [best_cnt], -1, 255, cv2.FILLED)
+
+        ell_mask = np.zeros((dyn_h, dyn_w), np.uint8)
+        axes = (
+            max(1, int(round(semi_major))),
+            max(1, int(round(semi_minor))),
+        )
+        cv2.ellipse(
+            ell_mask,
+            (int(round(cx_loc)), int(round(cy_loc))),
+            axes,
+            angle_deg, 0, 360,
+            255, cv2.FILLED,
+        )
+        inter = int(np.count_nonzero(cv2.bitwise_and(cnt_mask, ell_mask)))
+        union = int(np.count_nonzero(cv2.bitwise_or( cnt_mask, ell_mask)))
+        if union > 0:
+            result["iou"] = inter / union
+
+        # ---- Algebraic residuals q = sqrt((x'/a)^2 + (y'/b)^2) -----------
+        pts  = best_cnt.reshape(-1, 2).astype(float)
+        dx   = pts[:, 0] - cx_loc
+        dy   = pts[:, 1] - cy_loc
+        a_r  = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(a_r), math.sin(a_r)
+        xr   =  cos_a * dx + sin_a * dy
+        yr   = -sin_a * dx + cos_a * dy
+        a    = max(semi_major, 1e-9)
+        b    = max(semi_minor, 1e-9)
+        q    = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)
+        res  = np.abs(q - 1.0)
+        result["residual_mean"] = float(np.mean(res))
+        result["residual_rmse"] = float(np.sqrt(np.mean((q - 1.0) ** 2)))
+        result["residual_p95"]  = float(np.percentile(res, 95))
+
+    except Exception as exc:  # noqa: BLE001  — diagnostic; never propagated
+        logger.debug("_compute_ellipse_fit_quality: %s", exc)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Hough + dynamic-ROI ellipse detector (one drop per call)
 # ---------------------------------------------------------------------------
 
@@ -411,7 +525,7 @@ def _detect_drop_in_roi(
     # ------------------------------------------------------------------
     # 4–5. Evaluate every Hough candidate
     # ------------------------------------------------------------------
-    candidates: list[tuple[float, dict, np.ndarray]] = []  # (score, props_global, global_cnt)
+    candidates: list[tuple[float, dict, np.ndarray, dict]] = []  # (score, props_global, global_cnt, fit_quality)
     rejected_shape: int = 0
 
     for idx, circle in enumerate(circles_round):
@@ -625,6 +739,9 @@ def _detect_drop_in_roi(
             })
             _best_diag_level = 5
 
+        # Compute fit quality in local crop coordinates (diagnostic only)
+        _fit_quality = _compute_ellipse_fit_quality(best_cnt, props, dyn_h, dyn_w)
+
         # Translate to global frame coords (ROI offset + dynamic-crop offset)
         gx = x0 + dx0
         gy = y0 + dy0
@@ -747,7 +864,7 @@ def _detect_drop_in_roi(
             area_px, distance, score,
         )
 
-        candidates.append((score, props_g, global_cnt))
+        candidates.append((score, props_g, global_cnt, _fit_quality))
 
     # ------------------------------------------------------------------
     # 6. Select best candidate
@@ -766,7 +883,7 @@ def _detect_drop_in_roi(
             _best_diag["bodyellipse_failure_reason"] = "geometry_filter_rejected"
         return None, _best_diag
 
-    best_score, best_props, best_cnt_global = max(candidates, key=lambda t: t[0])
+    best_score, best_props, best_cnt_global, best_fit_quality = max(candidates, key=lambda t: t[0])
 
     logger.debug(
         "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f",
@@ -777,8 +894,9 @@ def _detect_drop_in_roi(
     )
 
     # Winning candidate used bodyellipse successfully
-    _best_diag["bodyellipse_used"] = True
-    _best_diag["method_final"] = "hough+adaptive+close+bodyellipse"
+    _best_diag["bodyellipse_used"]        = True
+    _best_diag["method_final"]            = "hough+adaptive+close+bodyellipse"
+    _best_diag["bodyellipse_fit_quality"] = best_fit_quality
     return (best_props, best_cnt_global), _best_diag
 
 
@@ -943,6 +1061,19 @@ def detect_bubbles(
     detection_sample  = _build_detection(
         right_props, right_cnt, px_to_mm, label="sample"
     )
+
+    # Attach bodyellipse fit-quality fields (diagnostic only — never used in
+    # detection, filtering, scoring, measurement, or calibration)
+    for _det, _diag in ((detection_control, ctrl_diag), (detection_sample, samp_diag)):
+        _fq = _diag.get("bodyellipse_fit_quality", {})
+        _det.bodyellipse_fit_point_count  = _fq.get("fit_point_count")
+        _det.bodyellipse_contour_area_px2 = _fq.get("contour_area_px2")
+        _det.bodyellipse_ellipse_area_px2 = _fq.get("ellipse_area_px2")
+        _det.bodyellipse_area_ratio       = _fq.get("area_ratio")
+        _det.bodyellipse_iou              = _fq.get("iou")
+        _det.bodyellipse_residual_mean    = _fq.get("residual_mean")
+        _det.bodyellipse_residual_rmse    = _fq.get("residual_rmse")
+        _det.bodyellipse_residual_p95     = _fq.get("residual_p95")
 
     return {
         "control": detection_control,
