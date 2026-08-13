@@ -106,8 +106,10 @@ class BubbleDetection:
     bodyellipse_residual_rmse:    float | None = None
     bodyellipse_residual_p95:     float | None = None
 
-    # ---- Visual diagnostic (not exported to CSV — used only for annotation) ----
-    body_start_y_global: int | None = None   # global y of body_start cut (bodyellipse)
+    # ---- Bodyellipse body-start diagnostic (exported to CSV) ------------------
+    body_start_y_global: int   | None = None   # global y of body_start (bodyellipse)
+    body_start_y_local:  int   | None = None   # local y within the dynamic crop
+    body_max_width:      int   | None = None   # maximum component row width (px)
 
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
@@ -141,6 +143,10 @@ class BubbleDetection:
             "bodyellipse_residual_mean":    round(self.bodyellipse_residual_mean,    4) if self.bodyellipse_residual_mean    is not None else None,
             "bodyellipse_residual_rmse":    round(self.bodyellipse_residual_rmse,    4) if self.bodyellipse_residual_rmse    is not None else None,
             "bodyellipse_residual_p95":     round(self.bodyellipse_residual_p95,     4) if self.bodyellipse_residual_p95     is not None else None,
+            # ---- Bodyellipse body-start (diagnostic) -----------------------
+            "body_start_y_global":          self.body_start_y_global,
+            "body_start_y_local":           self.body_start_y_local,
+            "body_max_width":               self.body_max_width,
         }
 
 
@@ -313,19 +319,37 @@ def _compute_ellipse_fit_quality(
     This function is called AFTER the winning candidate is selected and its results
     are never used for detection, filtering, scoring, or measurement.
 
+    After the FASE 3 refactor, ``best_cnt`` is an **open arc** — the subset of
+    the physical contour points with y >= body_start_y.  It is NOT a closed
+    polygon, so area-based metrics are geometrically invalid:
+
+    * ``contour_area_px2`` → always ``None`` (open arc has no meaningful area).
+    * ``area_ratio``       → always ``None`` (requires contour_area).
+    * ``iou``              → always ``None`` (rasterising an open arc as filled
+                             does not produce the physical drop body region).
+
+    The algebraic residuals (``residual_mean``, ``residual_rmse``,
+    ``residual_p95``) and ``ellipse_area_px2`` remain fully valid because they
+    depend only on the fitted ellipse parameters and the individual point
+    coordinates, not on any notion of enclosed area.
+
     Args:
-        best_cnt : Body contour in dynamic-crop coordinates (shape (N, 1, 2)).
+        best_cnt : Filtered physical contour arc in dynamic-crop coordinates
+                   (shape (N, 1, 2)).  Points have y >= body_start_y.
         props    : Output of ``_fit_single_ellipse``, same coordinate system.
-        dyn_h    : Height of the dynamic-crop canvas.
-        dyn_w    : Width  of the dynamic-crop canvas.
+        dyn_h    : Height of the dynamic-crop canvas (unused after FASE 3 but
+                   kept for API stability).
+        dyn_w    : Width of the dynamic-crop canvas (idem).
 
     Returns:
-        Dictionary with keys: fit_point_count, contour_area_px2,
-        ellipse_area_px2, area_ratio, iou, residual_mean, residual_rmse,
-        residual_p95.  Any field that cannot be computed is ``None``.
+        Dictionary with keys: fit_point_count, contour_area_px2 (None),
+        ellipse_area_px2, area_ratio (None), iou (None), residual_mean,
+        residual_rmse, residual_p95.  Any field that cannot be computed is
+        ``None``.
     """
     result: dict = {
         "fit_point_count":    len(best_cnt),
+        # Open arc — no geometrically valid area or IoU (see docstring)
         "contour_area_px2":   None,
         "ellipse_area_px2":   None,
         "area_ratio":         None,
@@ -335,42 +359,17 @@ def _compute_ellipse_fit_quality(
         "residual_p95":       None,
     }
     try:
-        contour_area = float(cv2.contourArea(best_cnt))
-        semi_major   = props["semi_major"]
-        semi_minor   = props["semi_minor"]
-        ellipse_area = math.pi * semi_major * semi_minor
-
-        result["contour_area_px2"] = contour_area
-        result["ellipse_area_px2"] = ellipse_area
-        if contour_area > 0:
-            result["area_ratio"] = ellipse_area / contour_area
+        semi_major = props["semi_major"]
+        semi_minor = props["semi_minor"]
+        # ellipse_area_px2 is a property of the fitted ellipse alone — valid
+        result["ellipse_area_px2"] = math.pi * semi_major * semi_minor
 
         cx_loc    = props["center_x"]
         cy_loc    = props["center_y"]
         angle_deg = props["angle_deg"]
 
-        # ---- IoU: rasterise contour and ellipse on the local crop canvas ----
-        cnt_mask = np.zeros((dyn_h, dyn_w), np.uint8)
-        cv2.drawContours(cnt_mask, [best_cnt], -1, 255, cv2.FILLED)
-
-        ell_mask = np.zeros((dyn_h, dyn_w), np.uint8)
-        axes = (
-            max(1, int(round(semi_major))),
-            max(1, int(round(semi_minor))),
-        )
-        cv2.ellipse(
-            ell_mask,
-            (int(round(cx_loc)), int(round(cy_loc))),
-            axes,
-            angle_deg, 0, 360,
-            255, cv2.FILLED,
-        )
-        inter = int(np.count_nonzero(cv2.bitwise_and(cnt_mask, ell_mask)))
-        union = int(np.count_nonzero(cv2.bitwise_or( cnt_mask, ell_mask)))
-        if union > 0:
-            result["iou"] = inter / union
-
         # ---- Algebraic residuals q = sqrt((x'/a)^2 + (y'/b)^2) -----------
+        # Valid for any set of points regardless of whether the arc is open.
         pts  = best_cnt.reshape(-1, 2).astype(float)
         dx   = pts[:, 0] - cx_loc
         dy   = pts[:, 1] - cy_loc
@@ -638,34 +637,78 @@ def _detect_drop_in_roi(
                 _best_diag_level = 1
             continue
 
-        # ---- Find body_start_y: first row >= 50 % of body_max_width -------
-        # sustained for at least 3 consecutive rows
-        _BODY_FRAC     = 0.50
-        _MIN_RUN       = 3
-        width_thresh   = _BODY_FRAC * body_max_width
-        body_start_y: int | None = None
-        run_start: int | None = None
-        run_len: int = 0
+        # ---- FASE 2: body_start_y via neck→body width transition -----------
+        #
+        # Strategy: estimate the characteristic neck width from the topmost
+        # occupied rows using the median (robust to single-row noise), then
+        # search downward for a sustained expansion relative to that neck width.
+        #
+        # Parameters (geometry-motivated, not tuned against output metrics):
+        #   _NECK_ROWS    – number of topmost occupied rows used to estimate
+        #                   neck width via median.  Keeps the estimate local to
+        #                   the capillary region (3–8 rows is sensible).
+        #   _EXPAND_FRAC  – minimum ratio  width(y) / neck_width  required to
+        #                   declare that the drop body has begun.  The physical
+        #                   transition is typically ≥ 2×; 1.6 is conservative.
+        #   _SUSTAIN_ROWS – consecutive rows that must exceed the expansion
+        #                   threshold before body_start_y is confirmed.  Guards
+        #                   against noise, reflections, and ragged edges.
+        _NECK_ROWS    = 5
+        _EXPAND_FRAC  = 1.6
+        _SUSTAIN_ROWS = 4
 
-        for row_y, w in enumerate(row_widths):
-            if w >= width_thresh:
-                if run_start is None:
-                    run_start = row_y
-                    run_len = 1
-                else:
-                    run_len += 1
-                if run_len >= _MIN_RUN:
-                    body_start_y = run_start
-                    break
+        body_start_y: int | None = None
+
+        # Collect the first _NECK_ROWS occupied (width > 0) row widths
+        occupied_rows = [(ry, w) for ry, w in enumerate(row_widths) if w > 0]
+
+        if len(occupied_rows) >= _NECK_ROWS:
+            neck_sample = [w for _, w in occupied_rows[:_NECK_ROWS]]
+            neck_width  = float(np.median(neck_sample))
+
+            if neck_width > 0:
+                expand_thresh = neck_width * _EXPAND_FRAC
+
+                # Search downward for a sustained expansion
+                run_start: int | None = None
+                run_len: int = 0
+                for row_y, w in occupied_rows:
+                    if w >= expand_thresh:
+                        if run_start is None:
+                            run_start = row_y
+                            run_len   = 1
+                        else:
+                            run_len += 1
+                        if run_len >= _SUSTAIN_ROWS:
+                            body_start_y = run_start
+                            break
+                    else:
+                        run_start = None
+                        run_len   = 0
+
+                logger.debug(
+                    "ROI [%s] circle #%d: neck_width=%.1f  expand_thresh=%.1f  "
+                    "body_start_y=%s (transition method)",
+                    roi_label, idx, neck_width, expand_thresh, body_start_y,
+                )
             else:
-                run_start = None
-                run_len = 0
+                logger.debug(
+                    "ROI [%s] circle #%d: neck_width=0 (degenerate) — "
+                    "no body_start_y found.",
+                    roi_label, idx,
+                )
+        else:
+            logger.debug(
+                "ROI [%s] circle #%d: fewer than %d occupied rows (%d) — "
+                "no body_start_y found.",
+                roi_label, idx, _NECK_ROWS, len(occupied_rows),
+            )
 
         if body_start_y is None:
             logger.debug(
                 "ROI [%s] circle #%d: could not find body_start_y "
-                "(body_max_width=%d, thresh=%.1f) — skipping.",
-                roi_label, idx, body_max_width, width_thresh,
+                "(body_max_width=%d) — skipping.",
+                roi_label, idx, body_max_width,
             )
             if _best_diag_level < 2:
                 _best_diag.update({
@@ -675,7 +718,7 @@ def _detect_drop_in_roi(
                 _best_diag_level = 2
             continue
 
-        # Global y of the body cut (for logging)
+        # Global y of the body start (for logging and diagnostic overlay)
         body_start_y_global = y0 + dy0 + body_start_y
 
         logger.debug(
@@ -684,40 +727,51 @@ def _detect_drop_in_roi(
             roi_label, idx, body_max_width, body_start_y, body_start_y_global,
         )
 
-        # ---- Body mask: keep only rows >= body_start_y --------------------
-        body_mask = comp_mask.copy()
-        body_mask[:body_start_y, :] = 0
+        # ---- FASE 3: filter physical contour points (no artificial boundary) -
+        #
+        # Instead of zeroing body_mask rows and re-running findContours (which
+        # introduces a perfectly horizontal artificial edge at body_start_y),
+        # we filter the points of the physical contour drop_cnt directly.
+        # drop_cnt was computed BEFORE any mask cut and contains only real
+        # boundary points of the connected component.
+        pts_all  = drop_cnt.reshape(-1, 2)          # shape (N, 2), local crop coords
+        keep     = pts_all[:, 1] >= body_start_y    # retain points at or below cut
+        pts_body = pts_all[keep]
 
-        body_contours, _ = cv2.findContours(
-            body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        n_body_pts = len(pts_body)
+        logger.debug(
+            "ROI [%s] circle #%d: physical contour filtered to %d / %d points "
+            "(y >= body_start_y=%d).",
+            roi_label, idx, n_body_pts, len(pts_all), body_start_y,
         )
 
-        if not body_contours:
+        # cv2.fitEllipse requires at least 5 points; never invent new points
+        if n_body_pts < 5:
             logger.debug(
-                "ROI [%s] circle #%d: no contours in body_mask — skipping.",
-                roi_label, idx,
+                "ROI [%s] circle #%d: only %d physical body points after filter "
+                "(< 5) — ellipse fit skipped.",
+                roi_label, idx, n_body_pts,
             )
-            if _best_diag_level < 3:
+            if _best_diag_level < 4:
                 _best_diag.update({
-                    "bodyellipse_failure_reason": "body_contour_missing",
+                    "bodyellipse_failure_reason": "body_contour_lt_5_points",
                     "body_max_width": body_max_width,
                     "body_start_y_local": body_start_y,
                     "body_start_y_global": body_start_y_global,
+                    "n_contour_points": n_body_pts,
                 })
-                _best_diag_level = 3
+                _best_diag_level = 4
             continue
 
-        best_cnt = max(body_contours, key=cv2.contourArea)
-        logger.debug(
-            "ROI [%s] circle #%d: body contour has %d points.",
-            roi_label, idx, len(best_cnt),
-        )
+        # Reshape to the (N, 1, 2) format expected by cv2.fitEllipse
+        best_cnt = pts_body.reshape(-1, 1, 2).astype(np.int32)
 
         props = _fit_single_ellipse(best_cnt)
 
         if props is None:
+            # Defensive: _fit_single_ellipse already checks len < 5 internally
             logger.debug(
-                "ROI [%s] circle #%d: body contour < 5 pts; ellipse fit skipped.",
+                "ROI [%s] circle #%d: ellipse fit returned None unexpectedly.",
                 roi_label, idx,
             )
             if _best_diag_level < 4:
@@ -726,7 +780,7 @@ def _detect_drop_in_roi(
                     "body_max_width": body_max_width,
                     "body_start_y_local": body_start_y,
                     "body_start_y_global": body_start_y_global,
-                    "n_contour_points": len(best_cnt),
+                    "n_contour_points": n_body_pts,
                 })
                 _best_diag_level = 4
             continue
@@ -738,11 +792,12 @@ def _detect_drop_in_roi(
                 "body_max_width": body_max_width,
                 "body_start_y_local": body_start_y,
                 "body_start_y_global": body_start_y_global,
-                "n_contour_points": len(best_cnt),
+                "n_contour_points": n_body_pts,
             })
             _best_diag_level = 5
 
-        # Compute fit quality in local crop coordinates (diagnostic only)
+        # Compute fit quality in local crop coordinates (diagnostic only).
+        # best_cnt here is the open physical arc; area/IoU are not valid.
         _fit_quality = _compute_ellipse_fit_quality(best_cnt, props, dyn_h, dyn_w)
 
         # Translate to global frame coords (ROI offset + dynamic-crop offset)
@@ -1078,8 +1133,10 @@ def detect_bubbles(
         _det.bodyellipse_residual_mean    = _fq.get("residual_mean")
         _det.bodyellipse_residual_rmse    = _fq.get("residual_rmse")
         _det.bodyellipse_residual_p95     = _fq.get("residual_p95")
-        # Visual diagnostic — not exported to CSV
+        # Diagnostic fields exported to CSV (never used in detection/scoring)
         _det.body_start_y_global = _diag.get("body_start_y_global")
+        _det.body_start_y_local  = _diag.get("body_start_y_local")
+        _det.body_max_width      = _diag.get("body_max_width")
 
     return {
         "control": detection_control,

@@ -305,17 +305,20 @@ def draw_detection_dual(
         """Overlay bodyellipse contour and body_start cut (diagnostic only).
 
         Draws:
-        * Magenta polyline : exact ``best_cnt`` (= ``det.contour``) that was
-          passed to ``cv2.fitEllipse``.  Any artificial horizontal edge created
-          by zeroing rows above ``body_start_y`` will be visible here.
-        * Yellow horizontal line : global y-position of ``body_start_y``.
-        * Orange dots : points of ``det.contour`` within \u00b11 px of the cut
-          — these are the boundary points created by the artificial zeroing.
+        * Magenta polyline : the filtered physical contour points that were
+          passed to ``cv2.fitEllipse`` (= ``det.contour``).  These are the
+          subset of the original component boundary with y >= body_start_y.
+          No artificial horizontal edge is present; all points are physical.
+        * Yellow horizontal line : global y-position of ``body_start_y``
+          (the neck→body transition found by the width-expansion algorithm).
+        * Orange dots : points of ``det.contour`` within ±1 px of the cut
+          line — confirms that points near the boundary are sparse/physical
+          (not a horizontal artifact row).
         """
         cnt = det.contour
         if cnt is None or len(cnt) < 2:
             return
-        # --- Magenta contour (body_mask outline used in fitEllipse) ----------
+        # --- Magenta polyline: physical arc points sent to cv2.fitEllipse ----
         cv2.drawContours(img, [cnt], -1, _COLOR_BODY_CNT, 1)
 
         bsy = det.body_start_y_global
