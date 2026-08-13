@@ -106,6 +106,9 @@ class BubbleDetection:
     bodyellipse_residual_rmse:    float | None = None
     bodyellipse_residual_p95:     float | None = None
 
+    # ---- Visual diagnostic (not exported to CSV — used only for annotation) ----
+    body_start_y_global: int | None = None   # global y of body_start cut (bodyellipse)
+
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
         return {
@@ -864,7 +867,7 @@ def _detect_drop_in_roi(
             area_px, distance, score,
         )
 
-        candidates.append((score, props_g, global_cnt, _fit_quality))
+        candidates.append((score, props_g, global_cnt, _fit_quality, body_start_y_global))
 
     # ------------------------------------------------------------------
     # 6. Select best candidate
@@ -883,7 +886,7 @@ def _detect_drop_in_roi(
             _best_diag["bodyellipse_failure_reason"] = "geometry_filter_rejected"
         return None, _best_diag
 
-    best_score, best_props, best_cnt_global, best_fit_quality = max(candidates, key=lambda t: t[0])
+    best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = max(candidates, key=lambda t: t[0])
 
     logger.debug(
         "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f",
@@ -897,6 +900,7 @@ def _detect_drop_in_roi(
     _best_diag["bodyellipse_used"]        = True
     _best_diag["method_final"]            = "hough+adaptive+close+bodyellipse"
     _best_diag["bodyellipse_fit_quality"] = best_fit_quality
+    _best_diag["body_start_y_global"]     = best_body_start_y_global  # winner's cut
     return (best_props, best_cnt_global), _best_diag
 
 
@@ -1074,6 +1078,8 @@ def detect_bubbles(
         _det.bodyellipse_residual_mean    = _fq.get("residual_mean")
         _det.bodyellipse_residual_rmse    = _fq.get("residual_rmse")
         _det.bodyellipse_residual_p95     = _fq.get("residual_p95")
+        # Visual diagnostic — not exported to CSV
+        _det.body_start_y_global = _diag.get("body_start_y_global")
 
     return {
         "control": detection_control,

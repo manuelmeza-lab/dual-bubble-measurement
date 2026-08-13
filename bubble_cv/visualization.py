@@ -63,6 +63,11 @@ _DUAL_MARKERS = {
     "sample":  "s",
 }
 
+# Bodyellipse diagnostic overlay colors (BGR)
+_COLOR_BODY_CNT   = (255,   0, 255)   # Magenta — exact contour passed to fitEllipse
+_COLOR_BODY_START = (  0, 255, 255)   # Yellow  — body_start horizontal cut line
+_COLOR_BODY_EDGE  = (  0, 165, 255)   # Orange  — contour points at the cut boundary
+
 
 # ---------------------------------------------------------------------------
 # Drawing helpers
@@ -244,18 +249,19 @@ def draw_detection_dual(
         lines: list[str],
         color_fg: tuple[int, int, int],
     ) -> None:
-        """Render lines left-aligned from the bottom-left corner."""
+        """Render lines left-aligned from the bottom-left corner, clamped to the left half."""
         # Pre-compute total block height to anchor from the bottom
         sizes = [cv2.getTextSize(l, _FONT, _FONT_SCALE, _FONT_THICK)[0] for l in lines]
         total_h = sum(th + _LINE_PAD for (_, th) in sizes)
         y = img_h - _MARGIN - total_h + sizes[0][1]   # first baseline
+        _max_x1 = img_w // 2 - 2   # never cross the centre line
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, _FONT, _FONT_SCALE, _FONT_THICK)
             x0, y0 = _MARGIN, y - th - 3
             x1, y1 = _MARGIN + tw + 6, y + 4
-            # Clip to image bounds
-            x0, y0 = max(0, x0), max(0, y0)
-            x1, y1 = min(img_w - 1, x1), min(img_h - 1, y1)
+            # Clip to image bounds and left-half constraint
+            x0, y0 = max(0, x0),         max(0, y0)
+            x1, y1 = min(_max_x1, x1),   min(img_h - 1, y1)
             cv2.rectangle(img, (x0, y0), (x1, y1), COLOR_TEXT_BG, -1)
             cv2.putText(
                 img, line, (_MARGIN + 3, y),
@@ -271,31 +277,75 @@ def draw_detection_dual(
         lines: list[str],
         color_fg: tuple[int, int, int],
     ) -> None:
-        """Render lines right-aligned from the bottom-right corner."""
+        """Render lines right-aligned from the bottom-right corner, clamped to the right half."""
         # Pre-compute total block height to anchor from the bottom
         sizes = [cv2.getTextSize(l, _FONT, _FONT_SCALE, _FONT_THICK)[0] for l in lines]
         total_h = sum(th + _LINE_PAD for (_, th) in sizes)
         y = img_h - _MARGIN - total_h + sizes[0][1]   # first baseline
+        _min_x0 = img_w // 2 + 2   # never cross the centre line
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, _FONT, _FONT_SCALE, _FONT_THICK)
             # Right edge: img_w - _MARGIN; text starts at img_w - _MARGIN - tw
             x_text = img_w - _MARGIN - tw - 3
             x0, y0 = x_text - 3, y - th - 3
             x1, y1 = img_w - _MARGIN, y + 4
-            x0, y0 = max(0, x0), max(0, y0)
-            x1, y1 = min(img_w - 1, x1), min(img_h - 1, y1)
+            x0, y0 = max(_min_x0, x0), max(0, y0)
+            x1, y1 = min(img_w - 1, x1),   min(img_h - 1, y1)
             cv2.rectangle(img, (x0, y0), (x1, y1), COLOR_TEXT_BG, -1)
             cv2.putText(
-                img, line, (max(0, x_text), y),
+                img, line, (max(_min_x0, x_text), y),
                 _FONT, _FONT_SCALE, color_fg, _FONT_THICK, cv2.LINE_AA,
             )
             y += th + _LINE_PAD
+
+    # ------------------------------------------------------------------
+    # Internal helper: draw body-contour + body_start diagnostic overlay
+    # ------------------------------------------------------------------
+    def _draw_body_diagnostic(img: np.ndarray, det: BubbleDetection) -> None:
+        """Overlay bodyellipse contour and body_start cut (diagnostic only).
+
+        Draws:
+        * Magenta polyline : exact ``best_cnt`` (= ``det.contour``) that was
+          passed to ``cv2.fitEllipse``.  Any artificial horizontal edge created
+          by zeroing rows above ``body_start_y`` will be visible here.
+        * Yellow horizontal line : global y-position of ``body_start_y``.
+        * Orange dots : points of ``det.contour`` within \u00b11 px of the cut
+          — these are the boundary points created by the artificial zeroing.
+        """
+        cnt = det.contour
+        if cnt is None or len(cnt) < 2:
+            return
+        # --- Magenta contour (body_mask outline used in fitEllipse) ----------
+        cv2.drawContours(img, [cnt], -1, _COLOR_BODY_CNT, 1)
+
+        bsy = det.body_start_y_global
+        if bsy is None:
+            return
+
+        # --- Yellow body_start line across the drop extent ------------------
+        cx      = int(det.center_x_px)
+        half_w  = max(int(det.major_axis_px // 2) + 8, 30)
+        x_left  = max(0,         cx - half_w)
+        x_right = min(img_w - 1, cx + half_w)
+        cv2.line(img, (x_left, bsy), (x_right, bsy), _COLOR_BODY_START, 1)
+
+        # --- Orange dots: contour points at the artificial cut boundary ------
+        pts = cnt.reshape(-1, 2)
+        boundary_mask = np.abs(pts[:, 1] - bsy) <= 1
+        for pt in pts[boundary_mask]:
+            cv2.circle(img, (int(pt[0]), int(pt[1])), 3, _COLOR_BODY_EDGE, -1)
 
     # ------------------------------------------------------------------
     # Step 1 — draw both ellipses (geometry only)
     # ------------------------------------------------------------------
     _draw_ellipse_geometry(annotated, control)
     _draw_ellipse_geometry(annotated, sample)
+
+    # ------------------------------------------------------------------
+    # Step 1b — draw bodyellipse diagnostic overlay
+    # ------------------------------------------------------------------
+    _draw_body_diagnostic(annotated, control)
+    _draw_body_diagnostic(annotated, sample)
 
     # ------------------------------------------------------------------
     # Step 2 — draw text blocks (if requested)
