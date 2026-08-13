@@ -111,6 +111,11 @@ class BubbleDetection:
     body_start_y_local:  int   | None = None   # local y within the dynamic crop
     body_max_width:      int   | None = None   # maximum component row width (px)
 
+    # ---- Geometry quality gate (set post-detection in analyze_video) ----------
+    # Based solely on bodyellipse_residual_rmse; never changes measured values.
+    geometry_quality_valid:            bool = True
+    geometry_quality_rejection_reason: str  = ""
+
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
         return {
@@ -147,6 +152,9 @@ class BubbleDetection:
             "body_start_y_global":          self.body_start_y_global,
             "body_start_y_local":           self.body_start_y_local,
             "body_max_width":               self.body_max_width,
+            # ---- Geometry quality gate -------------------------------------
+            "geometry_quality_valid":            self.geometry_quality_valid,
+            "geometry_quality_rejection_reason": self.geometry_quality_rejection_reason,
         }
 
 

@@ -31,6 +31,7 @@ Uso:
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -52,6 +53,13 @@ logger = logging.getLogger("bubble_cv")
 
 # Etiquetas de las dos gotas (orden espacial: izq → der)
 LABELS: tuple[str, str] = ("control", "sample")
+
+# Umbral de calidad geométrica del ajuste bodyellipse.
+# Basado exclusivamente en la distribución observada de residual_rmse:
+# ajustes normales ≈ 0.035–0.05 ; detecciones incorrectas ≈ >0.14–0.20.
+# El valor 0.08 se sitúa entre ambas poblaciones y fue elegido por
+# criterio geométrico — NO optimizado contra K ni R².
+BODYELLIPSE_MAX_RESIDUAL_RMSE: float = 0.08
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +162,45 @@ def parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Geometry quality gate
+# ---------------------------------------------------------------------------
+
+def apply_geometry_quality_gate(
+    detection: BubbleDetection,
+    max_residual_rmse: float = BODYELLIPSE_MAX_RESIDUAL_RMSE,
+) -> None:
+    """Marca la bandera geometry_quality_valid en el objeto BubbleDetection.
+
+    Criterio (todos deben cumplirse):
+        * bodyellipse_used — verificado implicitamente: si residual_rmse es
+          None, la bandera es False porque no hay ajuste disponible.
+        * bodyellipse_residual_rmse es finito (no None, no NaN, no inf).
+        * bodyellipse_residual_rmse ≤ max_residual_rmse.
+
+    Modifica los campos in-place.  NO modifica las medidas geométricas
+    (major_axis, minor_axis, equiv_diameter, volume, K) ni elimina la fila.
+
+    Args:
+        detection       : Objeto BubbleDetection ya procesado por el detector.
+        max_residual_rmse: Umbral; por defecto BODYELLIPSE_MAX_RESIDUAL_RMSE.
+    """
+    rmse = detection.bodyellipse_residual_rmse
+
+    if rmse is None or not math.isfinite(rmse):
+        detection.geometry_quality_valid            = False
+        detection.geometry_quality_rejection_reason = "bodyellipse_residual_rmse_missing"
+        return
+
+    if rmse > max_residual_rmse:
+        detection.geometry_quality_valid            = False
+        detection.geometry_quality_rejection_reason = "bodyellipse_residual_rmse"
+        return
+
+    detection.geometry_quality_valid            = True
+    detection.geometry_quality_rejection_reason = ""
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +558,10 @@ def main() -> int:
         validate_detection_physics(ctrl_det, max_eccentricity=args.max_eccentricity)
         validate_detection_physics(samp_det, max_eccentricity=args.max_eccentricity)
 
+        # Calidad geométrica del ajuste bodyellipse (independiente del QC físico)
+        apply_geometry_quality_gate(ctrl_det)
+        apply_geometry_quality_gate(samp_det)
+
         # Construir fila pareada con columnas prefijadas
         row: dict = {
             "frame_id": frame_num,
@@ -546,7 +597,29 @@ def main() -> int:
     # ── Calidad del ajuste bodyellipse ────────────────────────────────────
     _print_fit_quality_audit(df)
 
+    # ── DETECTION QUALITY SUMMARY ─────────────────────────────────────────
+    logger.info("=" * 64)
+    logger.info("DETECTION QUALITY SUMMARY")
+    logger.info("  RMSE threshold: %.4f", BODYELLIPSE_MAX_RESIDUAL_RMSE)
+    for _lbl in LABELS:
+        _gqv_col  = f"{_lbl}_geometry_quality_valid"
+        _n_det    = processed           # both drops detected (same for both sides)
+        if _gqv_col in df.columns:
+            _n_geom_ok  = int((df[_gqv_col] == True).sum())
+            _n_geom_rej = int((df[_gqv_col] == False).sum())
+        else:
+            _n_geom_ok  = _n_det
+            _n_geom_rej = 0
+        _pct_rej = 100.0 * _n_geom_rej / _n_det if _n_det > 0 else 0.0
+        logger.info(
+            "  %s: detections=%d  geometry_valid=%d  "
+            "geometry_rejected=%d  rejected_pct=%.1f%%",
+            _lbl.upper(), _n_det, _n_geom_ok, _n_geom_rej, _pct_rej,
+        )
+    logger.info("=" * 64)
+
     # ── Paso 6: Suavizado temporal ────────────────────────────────────────
+
     if args.smooth > 1:
         logger.info("Applying temporal smoothing (window=%d)...", args.smooth)
         _base_px = ["equiv_diameter_px", "major_axis_px", "minor_axis_px", "eccentricity"]
@@ -568,7 +641,12 @@ def main() -> int:
         out_col = f"{lbl}_evap_rate_mm3_s"
 
         if vol_col in df.columns and df[vol_col].notna().any():
-            df_valid = df[df[valid_col] == True].copy()
+            # Filtrar por tracking_valid Y geometry_quality_valid
+            _geom_col = f"{lbl}_geometry_quality_valid"
+            _evap_mask = df[valid_col] == True
+            if _geom_col in df.columns:
+                _evap_mask &= (df[_geom_col] == True)
+            df_valid = df[_evap_mask].copy()
             if len(df_valid) > 1:
                 rates = compute_evaporation_rate(
                     df_valid,
@@ -600,10 +678,12 @@ def main() -> int:
     if args.bin_size_s is not None and args.bin_size_s > 0.0:
         logger.info("Performing binned analysis (bin=%.2fs)...", args.bin_size_s)
 
-        # Usar solo filas donde AMBAS gotas son válidas
+        # Usar solo filas donde AMBAS gotas son válidas (tracking Y calidad geométrica)
         both_valid = (
             (df.get("control_tracking_valid", True) == True)
             & (df.get("sample_tracking_valid", True) == True)
+            & (df.get("control_geometry_quality_valid", True) == True)
+            & (df.get("sample_geometry_quality_valid", True) == True)
         )
         df_qc = df[both_valid].copy()
 
@@ -652,12 +732,19 @@ def main() -> int:
         summary_rows: list[dict] = []
 
         for lbl in LABELS:
-            valid_col = f"{lbl}_tracking_valid"
-            r2_col = f"{lbl}_radius_eq_mm2"
+            valid_col   = f"{lbl}_tracking_valid"
+            geom_col    = f"{lbl}_geometry_quality_valid"
+            r2_col      = f"{lbl}_radius_eq_mm2"
 
-            df_lbl = df[df[valid_col] == True] if valid_col in df.columns else df
+            # Filtrar por tracking_valid Y geometry_quality_valid
+            mask_valid = pd.Series([True] * len(df), index=df.index)
+            if valid_col in df.columns:
+                mask_valid &= (df[valid_col] == True)
+            if geom_col in df.columns:
+                mask_valid &= (df[geom_col] == True)
+            df_lbl = df[mask_valid]
             valid_frames = len(df_lbl)
-            rejected = failed + len(df[df.get(valid_col, pd.Series([True]*len(df))) == False])
+            rejected = failed + int((~mask_valid).sum())
 
             slope = intercept = r_sq = fit_start = fit_end = None
             b_slope = b_intercept = b_rsq = n_bins = None
