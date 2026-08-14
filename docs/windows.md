@@ -108,15 +108,15 @@ de BubbleCV también aceptan `/` en la mayoría de los casos.
 **Ejemplos de rutas válidas en Windows:**
 ```powershell
 # Con backslash (estilo Windows)
-python analyze_video.py --input path\to\video.mp4 --calibration 114.0
+python analyze_video.py --input path\to\video.mp4 --calibration PX_PER_MM
 
 # Con slash (funciona en Python)
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0
+python analyze_video.py --input path/to/video.mp4 --calibration PX_PER_MM
 ```
 
 Si la ruta contiene espacios, enciérrala en comillas:
 ```powershell
-python analyze_video.py --input "C:\Mi Carpeta\video.mp4" --calibration 114.0
+python analyze_video.py --input "C:\Mi Carpeta\video.mp4" --calibration PX_PER_MM
 ```
 
 ---

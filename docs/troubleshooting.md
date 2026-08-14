@@ -1,6 +1,10 @@
 # Solución de Problemas
 
-Esta guía cubre los errores más comunes al usar BubbleCV y cómo resolverlos.
+Esta guía cubre los errores y situaciones problemáticas más comunes al
+usar BubbleCV Dual.
+
+**Primera herramienta de diagnóstico:** los frames anotados generados con
+`--visualize`. Revisar esas imágenes antes de modificar cualquier parámetro.
 
 ---
 
@@ -12,7 +16,6 @@ OpenCV no está instalado o el entorno virtual no está activo.
 
 ```bash
 # 1. Verificar que el entorno virtual esté activo (debe verse "(venv)" en el prompt)
-# Si no está activo:
 source venv/bin/activate        # macOS/Linux
 venv\Scripts\Activate.ps1       # Windows PowerShell
 
@@ -33,11 +36,11 @@ Mismo problema. Ejecuta `pip install -r requirements.txt` con el entorno activo.
 
 ### "Failed to load image"
 
-- Verifica que la ruta sea correcta (sin errores de tipeo)
-- Verifica que el formato sea soportado: `.png`, `.jpg`, `.bmp`, `.tiff`
+- Verifica que la ruta sea correcta (sin errores de tipeo).
+- Verifica que el formato sea soportado: `.png`, `.jpg`, `.bmp`, `.tiff`.
 - Si la ruta tiene espacios, enciérrala en comillas:
   ```bash
-  python analyze_image.py --input "path/to/my image.png" --calibration 114.0
+  python analyze_image.py --input "path/to/mi imagen.png" --calibration XX.XX
   ```
 
 ### "Failed to open video" / `cap.isOpened()` devuelve `False`
@@ -45,7 +48,6 @@ Mismo problema. Ejecuta `pip install -r requirements.txt` con el entorno activo.
 El video tiene un formato o codec no soportado por OpenCV.
 
 ```bash
-# Verificar si OpenCV puede leer el video
 python - <<'EOF'
 import cv2
 cap = cv2.VideoCapture("path/to/video.mp4")
@@ -54,104 +56,152 @@ cap.release()
 EOF
 ```
 
-**Soluciones:**
+**Solución:**
 
-1. Convierte el video a MP4 H.264 con ffmpeg:
-   ```bash
-   ffmpeg -i path/to/input.mov -c:v libx264 -crf 18 path/to/output.mp4
-   ```
-   Consulta → [`docs/video_conversion.md`](./video_conversion.md)
+Convierte a MP4 H.264 con ffmpeg:
+```bash
+ffmpeg -i path/to/input.mov -c:v libx264 -crf 18 path/to/output.mp4
+```
 
-2. En macOS, reinstala OpenCV con soporte headless:
-   ```bash
-   pip uninstall opencv-python
-   pip install opencv-python-headless
-   ```
+Consulta → [`docs/video_conversion.md`](./video_conversion.md)
 
 ---
 
-## Errores de detección
+## Problemas de detección dual
 
-### "No bubble detected" / Detección fallida en todos los frames
+### "dual detection failed" en muchos frames
 
-La gota no fue detectada. Causas posibles:
+El detector no encontró una o ambas gotas en esos frames.
 
-| Causa | Solución |
-|-------|----------|
-| Gota fuera del rango de tamaño esperado | Ajustar `--min-radius` y `--max-radius` |
-| Imagen muy oscura, bajo contraste | Aumentar `--clip-limit` (ej: `5.0` o `7.0`) |
-| Fondo complejo, mucho ruido | Aumentar `--clip-limit` y reducir `--min-radius` |
-| Gota parcialmente fuera del encuadre | No hay solución automática; revisar el video |
-
-**Diagnóstico visual:**
+**Diagnóstico — primero:**
 ```bash
 python analyze_video.py \
-    --input path/to/video.mp4 \
-    --calibration 114.0 \
-    --fps 30 \
-    --skip 30 \
+    --input VIDEO.mp4 \
+    --calibration XX.XX \
+    --fps FPS_REAL \
+    --skip N \
     --visualize \
-    --vis-dir results/debug_frames \
+    --vis-dir RESULTS/debug \
     --verbose
 ```
 
-Revisa los frames en `results/debug_frames/` para ver dónde falla la detección.
+Revisa los frames en `RESULTS/debug/` para ver dónde y por qué falla.
+Causas comunes:
 
-### La elipse detectada no coincide con la gota
+| Causa | Señal |
+|-------|-------|
+| Gota fuera del ROI definido | Elipse en posición incorrecta o ausente |
+| Gota muy pequeña / muy grande | Sin detección Hough |
+| Imagen de bajo contraste | Segmentación incorrecta visible en frame anotado |
+| Capilar visible dentro del contorno | Cuerpo libre no aislado correctamente |
 
-- Aumenta `--clip-limit` para mejorar el contraste y definir mejor el borde
-- Ajusta `--min-radius` / `--max-radius` para restringir la búsqueda
-- Si la detección usa `method = hough_only`, el ajuste elíptico falló:
-  intenta con `--clip-limit` más alto o verifica que la gota tenga al
-  menos ~50 px de radio
+### geometry_quality_valid = False en muchos frames
 
-### Eccentricidad alta y errática entre frames
+El ajuste bodyellipse produce `residual_rmse > 0.08`.
 
-Causas habituales:
-- Iluminación inconsistente entre frames
-- Reflejo o brillo central dentro de la gota
-- Gota parcialmente fuera de foco
+**Diagnóstico:**
 
-Soluciones:
-```bash
-# Aplicar suavizado temporal
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0 \
-    --fps 30 --smooth 5
+1. Revisa los frames anotados. ¿La elipse verde sigue el borde externo de la
+   gota o se inclina / sobredimensiona?
+2. ¿La línea amarilla (body_start) aparece dentro del capilar en lugar de en
+   la transición cuello-cuerpo?
+3. ¿Hay reflejos internos brillantes que el detector confunde con el borde?
+4. ¿La gota vibra físicamente o está fuera de foco?
 
-# Aumentar el contraste
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0 \
-    --fps 30 --clip-limit 5.0
-```
+**Acciones según causa:**
 
-### Mediciones ruidosas o con saltos bruscos
+| Causa probable | Acción |
+|----------------|--------|
+| Frames del inicio/fin del experimento (gota inestable) | Recortar la ventana temporal |
+| Vibración física | Investigar la causa experimental; no es corregible en el software |
+| Reflejos internos dominando la segmentación | Revisar condiciones de iluminación |
+| body_start dentro del capilar | El pipeline detecta la transición; si falla sistemáticamente, revisar si la gota tiene forma inusual |
 
-```bash
-# Suavizado temporal con ventana de 5 frames
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0 \
-    --fps 30 --smooth 5
+**Lo que NO debes hacer:** cambiar `BODYELLIPSE_MAX_RESIDUAL_RMSE = 0.08`
+para "reducir" el rechazo. Ese umbral refleja calidad geométrica real.
 
-# Aumentar el salto de frames para reducir ruido de alta frecuencia
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0 \
-    --fps 30 --skip 30 --smooth 5
-```
+### residual_rmse > 0.08 en frames aislados (no agrupados)
+
+Es esperable en algunos frames por perturbaciones momentáneas. El filtro
+los excluye automáticamente. Revisa que no estén agrupados temporalmente.
+
+### La elipse no sigue el borde externo de la gota
+
+- Revisa en los frames anotados si el contorno magenta (puntos enviados a
+  fitEllipse) incluye el capilar superior.
+- Revisa si la línea body_start (amarilla) está demasiado alta.
+- No aumentes `--clip-limit` arbitrariamente para "arreglar" esto; puede
+  introducir artefactos en otros frames.
+
+### El contorno incluye reflejos internos
+
+Los reflejos especulares internos a la gota pueden hacer que la segmentación
+incluya esa región como parte del objeto. Esto produce contornos irregulares
+y residuos altos. Diagnóstico: ver el contorno magenta en los frames anotados.
+
+### Bodyellipse no produce resultado (body_contour_lt_5_points)
+
+El contorno físico del cuerpo libre tiene menos de 5 puntos después de filtrar
+por body_start_y. Causa probable: la gota es muy pequeña en esa región o la
+segmentación la fragmenta. No se inventa ningún punto; el frame se descarta.
 
 ---
 
 ## Problemas de calibración
 
-### Columnas `_mm` vacías en el CSV
+### Columnas `_mm` vacías o NaN en el CSV
 
-No se proporcionó calibración al ejecutar el análisis.
-```bash
-# Agrega --calibration con el valor px/mm
-python analyze_video.py --input path/to/video.mp4 --calibration 114.0 --fps 30
-```
+No se proporcionó calibración. Añade `--calibration XX.XX` con el valor
+medido para tu configuración óptica.
 
 ### La calibración automática detecta el objeto incorrecto
 
-- Asegúrate de que la imagen de calibración tenga un único objeto circular/esférico visible
-- Ajusta `--min-radius` y `--max-radius` para que coincidan con el tamaño del objeto de referencia en píxeles
-- Usa `--verbose` para ver qué detectó el sistema
+- Verifica que la imagen tenga un único objeto circular bien visible.
+- Ajusta `--min-radius` / `--max-radius` para restringir la búsqueda al
+  tamaño del objeto de referencia en píxeles.
+- Usa `--verbose` para ver qué detectó el sistema.
+- Si no converge, usa calibración manual (ver `docs/calibration.md`).
+
+### El FPS es incorrecto
+
+Si `--fps` no corresponde a la cadencia del archivo analizado, el eje de
+tiempo del CSV será incorrecto y K quedará escalado incorrectamente.
+Inspecciona los metadatos con ffprobe:
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=r_frame_rate,avg_frame_rate \
+  -of default=noprint_wrappers=1:nokey=1 VIDEO.mp4
+```
+
+---
+
+## Problemas de calidad de resultados
+
+### R² bajo en el ajuste lineal
+
+No es directamente un problema del software. Causas posibles:
+
+- La gota no está en régimen estacionario de evaporación (ventana temporal
+  mal elegida: inicio o fin de experimento).
+- Perturbaciones externas durante el experimento.
+- Frames rechazados por QC agrupados temporalmente (revisar distribución
+  de `geometry_quality_valid = False` en el CSV).
+- Mezcla de regímenes de evaporación distintos.
+
+**No** se debe ajustar parámetros del software para "mejorar" el R².
+
+### Saltos o escalones en la serie temporal
+
+- Revisa los frames anotados en la región del salto.
+- Puede ser un cambio real en la gota (perturbación física, vibración, contacto).
+- Puede ser un frame con detección errónea que pasó el QC.
+
+### Tendencia no lineal visible
+
+El modelo r_eq²(t) = r0² − K·t es lineal. Si la tendencia observada no es
+lineal, el régimen de evaporación puede ser diferente o la ventana temporal
+incluye fases distintas.
 
 ---
 
@@ -159,21 +209,20 @@ python analyze_video.py --input path/to/video.mp4 --calibration 114.0 --fps 30
 
 ### Error de permisos al acceder a la carpeta de videos
 
-macOS protege algunas carpetas. Ve a:
-**Ajustes del Sistema → Privacidad y Seguridad → Acceso total al disco**
-y agrega Terminal.
+Ve a **Ajustes del Sistema → Privacidad y Seguridad → Acceso total al disco**
+y añade Terminal.
 
 ### El proceso se interrumpe por suspensión del sistema
 
-Usa `caffeinate` para mantener el sistema activo:
 ```bash
-caffeinate -i python analyze_video.py --input path/to/video.mp4 ...
+caffeinate -i python analyze_video.py --input VIDEO.mp4 ...
 ```
+
 Consulta → [`docs/prevent_sleep.md`](./prevent_sleep.md)
 
 ### Error "Operation not permitted" en macOS Sonoma
 
-Puede ocurrir con archivos descargados de internet (atributo de cuarentena):
+Puede ocurrir con archivos descargados de internet:
 ```bash
 xattr -rd com.apple.quarantine /ruta/a/tu/carpeta/
 ```
@@ -185,11 +234,10 @@ xattr -rd com.apple.quarantine /ruta/a/tu/carpeta/
 ### PowerShell no puede ejecutar el script de activación del venv
 
 ```powershell
-# Ejecutar una sola vez como administrador
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-### Error con rutas que tienen espacios
+### Rutas con espacios
 
 ```powershell
 # Incorrecto
@@ -201,16 +249,14 @@ python analyze_video.py --input "Mi Carpeta\video.mp4"
 
 ### El video `.mov` no se abre en Windows
 
-Los archivos `.mov` con codec H.265/HEVC no son soportados directamente.
 Convierte con ffmpeg:
 ```bash
 ffmpeg -i video.mov -c:v libx264 -crf 18 video.mp4
 ```
-Consulta → [`docs/video_conversion.md`](./video_conversion.md)
 
 ---
 
 ## Recursos adicionales
 
 - Documentación de OpenCV: [docs.opencv.org](https://docs.opencv.org)
-- Abre un Issue en el repositorio si el error persiste
+- Manual operativo: [`docs/analysis_guide.md`](./analysis_guide.md)

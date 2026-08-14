@@ -19,7 +19,7 @@ mientras un comando se está ejecutando.
 ```bash
 caffeinate -i python analyze_video.py \
     --input path/to/video.mp4 \
-    --calibration 114.0 \
+    --calibration PX_PER_MM \
     --fps 30
 ```
 
@@ -103,7 +103,7 @@ Para evitarlo, puedes usar `nohup` en macOS/Linux:
 # El proceso continúa aunque cierres la terminal
 nohup caffeinate -i python analyze_video.py \
     --input path/to/video.mp4 \
-    --calibration 114.0 \
+    --calibration PX_PER_MM \
     --fps 30 \
     > analysis_log.txt 2>&1 &
 

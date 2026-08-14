@@ -104,3 +104,11 @@ resultados/
 ~$*
 *.xlsx
 *.xls
+
+Plan_de_desarrollo_Dual.md
+
+# ---------------------------------------------------------------------------
+# Imágenes científicas (datos crudos del microscopio)
+# ---------------------------------------------------------------------------
+*.tif
+*.tiff

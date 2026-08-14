@@ -2,7 +2,7 @@
 
 Para obtener mediciones en unidades físicas (mm, mm², mm³), el sistema
 necesita conocer la relación **píxeles por milímetro** (px/mm) de tu
-configuración óptica. Esta guía explica cómo obtener ese valor.
+configuración óptica.
 
 ---
 
@@ -12,127 +12,116 @@ Sin calibración, el sistema reporta solo medidas en píxeles. Con
 calibración, las columnas `_mm`, `_mm2` y `_mm3` del CSV se llenan
 con valores físicos reales.
 
-La relación px/mm depende de:
-- El aumento del objetivo del microscopio
-- La resolución de captura de la cámara
-- La distancia de trabajo
+La relación px/mm depende de todos los factores del sistema óptico:
 
-**Debe recalibrarse si cambias cualquiera de estos parámetros.**
+- resolución de captura de la cámara
+- nivel de zoom / objetivo del microscopio
+- distancia de trabajo
+- posición axial de la cámara
 
----
+**Debe recalibrarse si cambia cualquiera de estos parámetros.**
 
-## Objetos de referencia recomendados
-
-Usa un objeto de **dimensiones conocidas y estables**. Ejemplos comunes:
-
-| Objeto | Tamaño típico | Notas |
-|--------|--------------|-------|
-| Esfera de referencia | 4.0 mm de diámetro | Alta precisión, fácil de medir en imagen |
-| Regla micrométrica | Graduada en µm | Ideal para calibración precisa |
-| Papel milimétrico | 1 mm por cuadro | Útil para estimaciones rápidas |
-| Objeto de dimensión conocida | Variable | Cualquier objeto medible |
+Nunca uses un valor px/mm de otro experimento, de otra sesión con diferente
+zoom, ni un valor genérico: la calibración es específica de cada configuración.
 
 ---
 
-## Método A — Calibración manual
+## Consideraciones de precisión
 
-1. Captura una imagen del objeto de referencia con la misma
-   configuración que usarás para tus gotas (mismo zoom, misma distancia)
-
-2. Abre la imagen en cualquier visor y mide el objeto en píxeles:
-
-   - **macOS (Preview):** Abre la imagen → Menú `Herramientas → Mostrar Inspector`
-     → Pestaña de regla. También puedes usar `Herramientas → Anotar → Regla`.
-   - **Windows (Paint):** Abre la imagen → pasa el cursor sobre los extremos
-     del objeto. Las coordenadas se muestran en la barra de estado.
-   - **Fiji/ImageJ (multiplataforma):** Abre la imagen → usa la herramienta
-     de Línea (`m`) y mide con `Ctrl+M`.
-
-3. Calcula la relación:
-   ```
-   px_to_mm = diámetro_en_píxeles / diámetro_real_en_mm
-
-   Ejemplo: si la esfera de 4 mm mide 456 px en la imagen:
-   px_to_mm = 456 / 4.0 = 114.0
-   ```
-
-4. Usa ese valor con la bandera `--calibration`:
-   ```bash
-   python analyze_image.py --input path/to/drop.png --calibration 114.0
-   python analyze_video.py --input path/to/video.mp4 --calibration 114.0 --fps 30
-   ```
+- Calibra con la **misma resolución, zoom, distancia de trabajo y posición
+  óptica** que usarás durante el experimento.
+- No muevas la cámara entre la calibración y el experimento.
+- La relación px/mm puede variar entre la parte central y los bordes de la
+  imagen (distorsión de lente). Para mayor precisión, coloca el objeto de
+  referencia **cerca de la posición donde aparece la gota** en el experimento.
+- En sistemas de doble gota, la posición izquierda y derecha pueden tener
+  factores px/mm ligeramente distintos si hay distorsión espacial. BubbleCV
+  aplica un único factor a ambas gotas; si la distorsión es significativa,
+  documéntalo como fuente de incertidumbre.
 
 ---
 
-## Método B — Calibración automática
+## Objetos de referencia
 
-Deja que el sistema detecte automáticamente el objeto de referencia
-y calcule la relación px/mm:
+Usa un objeto de **dimensiones conocidas y estables**.
 
-```bash
-python analyze_image.py \
-    --input path/to/drop.png \
-    --calibrate-from path/to/calibration.png \
-    --ref-diameter 4.0
+El objeto utilizado en este proyecto es una **esfera de 4 mm de diámetro**.
+El valor de `--ref-diameter` debe corresponder al diámetro real de tu objeto
+de referencia en milímetros.
+
+---
+
+## Método A — Calibración automática (recomendada)
+
+La calibración automática está implementada en `bubble_cv/calibration.py`
+y usa la función `detect_reference_object()` de `bubble_cv/detection.py`.
+
+### Cómo funciona el detector de calibración
+
+Este detector es **completamente independiente** del pipeline de detección
+dual de gotas:
+
+- Opera sobre el **frame completo** (sin ROIs izquierda/derecha).
+- No aplica filtros de gota colgante (no hay ventana de posición vertical,
+  no hay umbral de excentricidad de gota, no hay aislamiento cuello/cuerpo,
+  no hay restricción de posición del capilar).
+- No asume que haya un capilar presente.
+- La métrica primaria es el **diámetro del círculo de Hough**
+  (`2 × radio_Hough`), que es robusto para un objeto esférico simétrico.
+- Se realiza adicionalmente un ajuste elíptico sobre la máscara Otsu,
+  pero **únicamente como diagnóstico**: si la diferencia entre el diámetro
+  Hough y el diámetro equivalente de la elipse supera el 5%, se emite una
+  advertencia en el log. La métrica devuelta al llamador es siempre el
+  diámetro Hough.
+
+El px/mm se calcula como:
+```
+px_to_mm = diámetro_Hough_px / diámetro_conocido_mm
 ```
 
-| Bandera | Descripción |
-|---------|-------------|
-| `--calibrate-from` | Imagen del objeto de referencia |
-| `--ref-diameter` | Diámetro real del objeto de referencia en mm |
-
-El sistema detectará la esfera en la imagen de calibración usando el
-mismo pipeline de Hough Circle, calculará el px/mm automáticamente
-y lo aplicará al análisis.
-
-> **Consejo:** Si la calibración automática falla, usa el Método A
-> para obtener el valor manualmente y pásalo con `--calibration`.
-
----
-
-## Verificar la calibración
-
-Usa `--verbose` para ver el valor calculado en la terminal:
+### Comando
 
 ```bash
 python analyze_image.py \
-    --input path/to/drop.png \
-    --calibrate-from path/to/calibration.png \
+    --input referencia.png \
+    --calibrate-from referencia.png \
     --ref-diameter 4.0 \
     --verbose
 ```
 
-La salida incluirá una línea similar a:
+La línea de salida relevante es:
 ```
-[INFO] Calibration: 114.25 px/mm (error: 0.2%)
+[INFO] Calibration: reference diameter detected = XX.XX px | known diameter = Y.YY mm | calibration = ZZ.ZZZZ px/mm
 ```
 
-Un error menor al 5% se considera aceptable para la mayoría de los análisis.
+Usa el valor `ZZ.ZZZZ` en `--calibration` para el análisis de video.
+
+Si la calibración automática falla (no detecta el objeto), verifica que
+la imagen tenga un único objeto circular bien definido y ajusta
+`--min-radius` / `--max-radius` para que coincidan con el tamaño del
+objeto en píxeles. Usa `--verbose` para ver qué detectó el sistema.
 
 ---
 
-## Tabla de valores típicos (referencia)
+## Método B — Calibración manual
 
-Los siguientes valores son solo de referencia. **Siempre calibra con tu
-propia imagen** porque los valores reales dependen de tu equipo específico.
+1. Captura una imagen del objeto de referencia con exactamente la misma
+   configuración óptica que usarás para el experimento.
 
-| Configuración | px/mm aproximado |
-|--------------|-----------------|
-| Resolución baja (640×480), zoom estándar | ~50–80 |
-| Resolución media (1280×720), zoom estándar | ~100–150 |
-| Resolución alta (1920×1080), zoom estándar | ~180–250 |
+2. Mide el diámetro del objeto en píxeles con un visor de imágenes:
+   - **macOS (Preview):** Herramientas → Anotar → Regla
+   - **Windows (Paint):** posición del cursor en la barra de estado
+   - **Fiji/ImageJ:** herramienta de línea + `Ctrl+M`
 
----
+3. Calcula la relación:
+   ```
+   px_to_mm = diámetro_en_píxeles / diámetro_real_en_mm
+   ```
 
-## Consideraciones importantes
-
-- **Calibra en las mismas condiciones que el experimento:** misma distancia,
-  mismo zoom, misma resolución.
-- **No muevas la cámara** entre la calibración y el experimento.
-- **Si la cámara se mueve**, repite la calibración.
-- La relación px/mm puede variar entre la parte central y los bordes de
-  la imagen (distorsión de lente). Para máxima precisión, coloca el objeto
-  de referencia en la región donde aparecerá la gota.
+4. Usa ese valor con `--calibration`:
+   ```bash
+   python analyze_video.py --input VIDEO.mp4 --calibration XX.XX --fps FPS_REAL
+   ```
 
 ---
 

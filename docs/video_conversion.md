@@ -1,14 +1,14 @@
 # Conversión de Video
 
-Esta guía explica cómo preparar tus videos para analizarlos con BubbleCV,
+Esta guía explica cómo preparar los videos para analizarlos con BubbleCV Dual,
 incluyendo conversión de formato, verificación de FPS y extracción de segmentos.
 
 ---
 
 ## ¿Por qué convertir videos?
 
-OpenCV (la librería de visión que usa BubbleCV) tiene soporte limitado para
-algunos formatos y codecs. Los formatos más compatibles son:
+OpenCV tiene soporte limitado para algunos formatos y codecs. Los formatos
+más compatibles son:
 
 | Formato | Compatibilidad | Notas |
 |---------|----------------|-------|
@@ -25,104 +25,104 @@ algunos formatos y codecs. Los formatos más compatibles son:
 
 ## Instalar ffmpeg
 
-`ffmpeg` es la herramienta estándar para conversión de video. Es gratuita
-y de código abierto.
-
 ### macOS
 
 ```bash
-# Con Homebrew (recomendado)
 brew install ffmpeg
-
-# Verificar
 ffmpeg -version
 ```
 
 ### Windows
 
-1. Descarga el build desde [ffmpeg.org/download.html](https://ffmpeg.org/download.html)
-   (elige "Windows builds from gyan.dev")
-2. Descarga el ZIP "release full"
-3. Descomprime en una carpeta fija, por ejemplo `C:\ffmpeg\`
-4. Agrega `C:\ffmpeg\bin` al PATH del sistema:
-   - Busca "Variables de entorno" en el menú inicio
-   - En "Path" del usuario → Agregar `C:\ffmpeg\bin`
-5. Abre un CMD nuevo y verifica:
-   ```
-   ffmpeg -version
-   ```
+1. Descarga desde [ffmpeg.org/download.html](https://ffmpeg.org/download.html)
+   (elige "Windows builds from gyan.dev" → "release full").
+2. Descomprime en `C:\ffmpeg\`.
+3. Añade `C:\ffmpeg\bin` al PATH del sistema.
+4. Abre un CMD nuevo y verifica: `ffmpeg -version`
 
 ---
 
-## Conversiones comunes
+## Inspeccionar la tasa de cuadros del video
 
-### Convertir a MP4 (H.264) — uso general
+La cadencia del video debe inspeccionarse con ffprobe antes de analizar. No
+debe suponerse a partir del nombre del archivo ni del FPS nominal del equipo
+de captura.
 
 ```bash
-ffmpeg -i path/to/input.mov -c:v libx264 -crf 18 -preset slow path/to/output.mp4
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=r_frame_rate,avg_frame_rate \
+  -of default=noprint_wrappers=1:nokey=1 VIDEO.mp4
+```
+
+`r_frame_rate` y `avg_frame_rate` son metadatos útiles para detectar
+discrepancias. En archivos VFR pueden diferir y no deben interpretarse
+automáticamente como una cronología exacta frame a frame.
+
+También puedes ver más información del stream:
+
+```bash
+ffprobe -v quiet -print_format json -show_streams VIDEO.mp4 | grep r_frame_rate
+```
+
+---
+
+## Conversión a MP4 H.264 (uso general)
+
+```bash
+ffmpeg -i input.mov -c:v libx264 -crf 18 output.mp4
 ```
 
 | Parámetro | Significado |
 |-----------|-------------|
 | `-c:v libx264` | Codec de video H.264 |
-| `-crf 18` | Calidad (0=mejor, 51=peor; 18-23 es rango recomendado) |
-| `-preset slow` | Mayor compresión a cambio de más tiempo |
+| `-crf 18` | Calidad (0=mejor, 51=peor; 18 es alta calidad) |
 
-### Convertir sin pérdida de calidad (lossless)
-
+Para mayor compresión a cambio de más tiempo de procesamiento:
 ```bash
-ffmpeg -i path/to/input.mov -c:v libx264 -crf 0 path/to/output_lossless.mp4
+ffmpeg -i input.mov -c:v libx264 -crf 18 -preset slow output.mp4
 ```
-
-### Convertir desde formato de cámara microscópica (AVI sin comprimir)
-
-```bash
-ffmpeg -i path/to/microscope_raw.avi -c:v libx264 -crf 18 path/to/output.mp4
-```
-
-### Extraer un segmento (recortar en tiempo)
-
-Útil para analizar solo una parte del video:
-
-```bash
-# Extraer desde 0:30 hasta 2:00 (90 segundos)
-ffmpeg -i path/to/input.mp4 -ss 00:00:30 -t 00:01:30 -c copy path/to/segment.mp4
-```
-
-| Parámetro | Significado |
-|-----------|-------------|
-| `-ss` | Tiempo de inicio (hh:mm:ss) |
-| `-t` | Duración del segmento |
-| `-c copy` | Copia sin recodificar (más rápido) |
 
 ---
 
-## Verificar el FPS del video
+## Extracción de un segmento temporal
 
-Antes de analizar, es importante conocer los fotogramas por segundo (FPS)
-de tu video para que el eje de tiempo del CSV sea correcto.
+Para analizar solo una parte del video, usa recodificación H.264 en lugar
+de `-c copy`. La opción `-c copy` es más rápida pero puede producir
+timestamps irregulares (VFR), lo que afecta el cálculo de tiempo en BubbleCV.
 
 ```bash
-# Con ffmpeg
-ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
-    -of default=noprint_wrappers=1:nokey=1 path/to/video.mp4
+ffmpeg -i input.mov \
+  -ss INICIO_EN_SEGUNDOS \
+  -t DURACION_EN_SEGUNDOS \
+  -c:v libx264 \
+  -crf 18 \
+  output_segmento.mp4
 ```
 
-La salida será una fracción como `30/1` (30 FPS) o `25/1` (25 FPS).
+### Ejemplo: protocolo histórico de este proyecto (150–650 s)
 
-**También puedes verlo con:**
+En el protocolo histórico de validación de este proyecto se ha utilizado
+la ventana **150–650 s** (500 s de duración) en videos suficientemente largos.
+Esta ventana se eligió experimentalmente para ese protocolo específico y
+**no es una regla universal**: si el protocolo cambia, la ventana debe
+justificarse de nuevo.
+
 ```bash
-ffprobe -v quiet -print_format json -show_streams path/to/video.mp4 | grep r_frame_rate
+ffmpeg -i input.mov \
+  -ss 150 \
+  -t 500 \
+  -c:v libx264 \
+  -crf 18 \
+  output_150_650.mp4
 ```
 
-### FPS comunes y su uso en BubbleCV
+---
 
-| FPS del video | Bandera en BubbleCV | Notas |
-|--------------|---------------------|-------|
-| 30 FPS | `--fps 30` | Estándar para cámaras USB/web |
-| 25 FPS | `--fps 25` | PAL (Europa/México común) |
-| 60 FPS | `--fps 60` | Cámaras de alta velocidad |
-| 15 FPS | `--fps 15` | Algunas cámaras microscópicas |
+## Conversión sin pérdida de calidad (lossless)
+
+```bash
+ffmpeg -i input.mov -c:v libx264 -crf 0 output_lossless.mp4
+```
 
 ---
 
@@ -131,9 +131,9 @@ ffprobe -v quiet -print_format json -show_streams path/to/video.mp4 | grep r_fra
 ```bash
 python - <<'EOF'
 import cv2
-cap = cv2.VideoCapture("path/to/video.mp4")
+cap = cv2.VideoCapture("VIDEO.mp4")
 print("Abierto:", cap.isOpened())
-print("FPS:", cap.get(cv2.CAP_PROP_FPS))
+print("FPS (metadato):", cap.get(cv2.CAP_PROP_FPS))
 print("Frames totales:", cap.get(cv2.CAP_PROP_FRAME_COUNT))
 print("Resolución:", int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
       "x", int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -141,21 +141,25 @@ cap.release()
 EOF
 ```
 
-Si `Abierto: False`, el video tiene un codec no soportado → convierte con ffmpeg.
+> Nota: OpenCV y ffprobe pueden reportar valores distintos cuando la
+temporización del archivo es irregular. Si existe discrepancia, inspecciona
+el archivo y normalízalo a CFR antes del análisis.
 
 ---
 
-## Videos muy largos: estrategia de análisis
+## Estrategia para videos largos
 
-Para videos de horas de duración, usa `--skip` para reducir el tiempo de procesamiento:
+Para videos de muchos minutos o horas, usa `--skip` para reducir el tiempo
+de procesamiento:
 
 ```bash
-# Procesar 1 frame por segundo (en un video a 30 FPS)
+# Plantilla para un archivo CFR verificado a 30 FPS.
+# Sustituye XX.XX por la calibración correspondiente.
 python analyze_video.py \
-    --input path/to/video.mp4 \
-    --calibration 114.0 \
+    --input VIDEO.mp4 \
+    --calibration XX.XX \
     --fps 30 \
     --skip 30
 ```
 
-Consulta → [`docs/analysis_guide.md`](./analysis_guide.md) para más estrategias.
+Consulta → [`docs/analysis_guide.md`](./analysis_guide.md) para el flujo completo.
