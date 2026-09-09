@@ -234,9 +234,23 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
 
     (cx, cy), (axis1, axis2), angle = cv2.fitEllipse(contour)
 
-    # cv2.fitEllipse returns *full* axis lengths (diameters)
-    major_axis = max(axis1, axis2)
-    minor_axis = min(axis1, axis2)
+    # cv2.fitEllipse returns *full* axis lengths (diameters).
+    # Canonicalise so that major_axis >= minor_axis AND angle_deg always
+    # points along the major axis.
+    # When axis1 >= axis2 the returned angle already references axis1 (the
+    # major one); when axis1 < axis2 the major axis is axis2, which is
+    # perpendicular to the stored angle — so we rotate 90°.
+    if axis1 >= axis2:
+        major_axis = axis1
+        minor_axis = axis2
+        major_angle = angle
+    else:
+        major_axis = axis2
+        minor_axis = axis1
+        major_angle = angle + 90.0
+
+    major_angle %= 180.0          # keep in [0, 180)
+
     semi_major = major_axis / 2.0
     semi_minor = minor_axis / 2.0
 
@@ -245,7 +259,7 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
         "center_y": cy,
         "major_axis": major_axis,
         "minor_axis": minor_axis,
-        "angle_deg": angle,
+        "angle_deg": major_angle,
         "semi_major": semi_major,
         "semi_minor": semi_minor,
         "eccentricity": eccentricity(semi_major, semi_minor),
