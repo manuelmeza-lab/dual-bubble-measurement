@@ -52,6 +52,22 @@ logger = logging.getLogger(__name__)
 _CAPILLARY_KERNEL_SIZE: int = 7      # Side length of the elliptical SE
 _CAPILLARY_OPEN_ITERS: int = 2       # Number of erosion+dilation cycles
 
+# ---------------------------------------------------------------------------
+# Body-selector consensus constants (Fix 2 — frozen, not CLI-configurable)
+# ---------------------------------------------------------------------------
+#: Maximum radius gap (mm) for two candidates to be considered mutually
+#: consistent and contribute to each other's support count.
+BODY_CONSENSUS_RADIUS_EPS_MM: float = 0.010
+
+#: Minimum support a consensus candidate must have before a switch is
+#: considered.  A value of 2 means at least one other candidate agrees.
+BODY_CONSENSUS_MIN_SUPPORT: int = 2
+
+#: Minimum ratio rmse_top1 / rmse_consensus that triggers a switch.  The
+#: condition is *strictly* greater-than, so a ratio of exactly 2.0 is NOT
+#: a switch.
+BODY_RMSE_RATIO_THRESHOLD: float = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -414,6 +430,174 @@ def _compute_ellipse_fit_quality(
 
 
 # ---------------------------------------------------------------------------
+# Body-selector: conservative consensus override (Fix 2)
+# ---------------------------------------------------------------------------
+
+def _select_body_candidate(
+    candidates: list,
+    px_to_mm: float | None,
+) -> tuple:
+    """Select the best body candidate using a conservative consensus strategy.
+
+    This function is a **pure drop-in replacement** for the historical
+    ``max(candidates, key=lambda c: c[0])`` call.  It returns the same
+    5-element tuple ``(score, props_global, global_cnt, fit_quality,
+    body_start_y_global)`` that the legacy selector would have returned.
+
+    Algorithm
+    ---------
+    1. Compute Top-1 as ``max(candidates, key=lambda c: c[0])`` — unchanged
+       historical behaviour.
+    2. If ``px_to_mm`` is None or only one candidate exists, return Top-1
+       immediately (selector disabled / no choice).
+    3. For each candidate *j* compute::
+
+           radius_j = c[j][1]["equiv_diameter_px"] / (2 * px_to_mm)
+           support_j = count(abs(radius_i - radius_j) <= BODY_CONSENSUS_RADIUS_EPS_MM
+                             for all i in candidates)
+
+    4. The consensus candidate is the one with the highest ``support_j``.
+       Tie-break: lowest ``c[3]["residual_rmse"]``.  Exact numeric ties in
+       RMSE resolve to the first candidate in list order (deterministic).
+    5. Switch condition (both must hold)::
+
+           support_consensus >= BODY_CONSENSUS_MIN_SUPPORT
+           AND rmse_ratio     >  BODY_RMSE_RATIO_THRESHOLD
+
+       where ``rmse_ratio = rmse_top1 / rmse_consensus``.
+    6. Any None / NaN / non-finite RMSE value prevents the switch.
+    7. If the switch fires, return the consensus candidate; otherwise Top-1.
+
+    Args:
+        candidates: Non-empty list of 5-tuples produced by the candidate
+                    evaluation loop inside ``_detect_drop_in_roi``.
+        px_to_mm:   Calibration factor (px/mm), or None when uncalibrated.
+
+    Returns:
+        A dict containing:
+            ``selected``   – the chosen 5-tuple candidate,
+            ``switched``   – bool, True when consensus overrides Top-1,
+            ``support``    – int support of the consensus candidate (or None),
+            ``rmse_ratio`` – float rmse_ratio (or None),
+            ``top1_radius_mm``      – float radius of Top-1 in mm (or None),
+            ``selected_radius_mm``  – float radius of selected in mm (or None).
+    """
+    # Historical Top-1 — index-based to avoid list.index() over tuples that
+    # contain np.ndarray (identity comparison via == raises ValueError).
+    # max() over range preserves the historical behaviour: first candidate wins
+    # on score ties, matching the original max(candidates, key=lambda c: c[0]).
+    top1_idx = max(range(len(candidates)), key=lambda i: candidates[i][0])
+    top1 = candidates[top1_idx]
+
+    # Initialise audit fields to safe defaults
+    _audit: dict = {
+        "selected":          top1,
+        "switched":          False,
+        "support":           None,
+        "rmse_ratio":        None,
+        "top1_radius_mm":    None,
+        "selected_radius_mm": None,
+    }
+
+    # Selector disabled: no calibration or single candidate.
+    # With px_to_mm available, populate radius diagnostics even for single candidate.
+    if len(candidates) < 2:
+        if px_to_mm is not None:
+            _r = candidates[top1_idx][1]["equiv_diameter_px"] / (2.0 * px_to_mm)
+            _audit["top1_radius_mm"]     = _r
+            _audit["selected_radius_mm"] = _r
+        return _audit
+    if px_to_mm is None:
+        return _audit
+
+    # ------------------------------------------------------------------ #
+    # Compute radii in mm for all candidates
+    # ------------------------------------------------------------------ #
+    radii_mm: list[float] = [
+        c[1]["equiv_diameter_px"] / (2.0 * px_to_mm)
+        for c in candidates
+    ]
+
+    _audit["top1_radius_mm"] = radii_mm[top1_idx]
+
+    # ------------------------------------------------------------------ #
+    # Compute support for every candidate
+    # ------------------------------------------------------------------ #
+    n = len(candidates)
+    supports: list[int] = []
+    for j in range(n):
+        sup = sum(
+            1
+            for i in range(n)
+            if abs(radii_mm[i] - radii_mm[j]) <= BODY_CONSENSUS_RADIUS_EPS_MM
+        )
+        supports.append(sup)
+
+    max_support = max(supports)
+
+    # ------------------------------------------------------------------ #
+    # Consensus candidate: max support → min RMSE tie-break
+    # ------------------------------------------------------------------ #
+    consensus_idx: int | None = None
+    best_rmse_for_consensus: float = math.inf
+
+    for j in range(n):
+        if supports[j] != max_support:
+            continue
+        rmse_j = candidates[j][3].get("residual_rmse")
+        # None / NaN / non-finite RMSE: treat as very large (never wins tie-break
+        # unless ALL tied candidates have bad RMSE, in which case list order wins)
+        if rmse_j is None or not math.isfinite(rmse_j):
+            rmse_j = math.inf
+        if rmse_j < best_rmse_for_consensus:
+            best_rmse_for_consensus = rmse_j
+            consensus_idx = j
+
+    if consensus_idx is None:
+        # Defensive: should not happen with a non-empty candidates list
+        return _audit
+
+    _audit["support"] = max_support
+    _audit["selected_radius_mm"] = radii_mm[top1_idx]  # default = top1
+
+    # ------------------------------------------------------------------ #
+    # Switch guard: support AND rmse_ratio
+    # ------------------------------------------------------------------ #
+    if max_support < BODY_CONSENSUS_MIN_SUPPORT:
+        return _audit
+
+    rmse_top1      = candidates[top1_idx][3].get("residual_rmse")
+    rmse_consensus = candidates[consensus_idx][3].get("residual_rmse")
+
+    # Any non-finite RMSE → no switch
+    if (
+        rmse_top1      is None or not math.isfinite(rmse_top1)
+        or rmse_consensus is None or not math.isfinite(rmse_consensus)
+        or rmse_consensus == 0.0
+    ):
+        return _audit
+
+    rmse_ratio = rmse_top1 / rmse_consensus
+    _audit["rmse_ratio"] = rmse_ratio
+
+    if rmse_ratio <= BODY_RMSE_RATIO_THRESHOLD:   # strictly > required
+        return _audit
+
+    # Switch fires
+    _audit["selected"]          = candidates[consensus_idx]
+    _audit["switched"]          = True
+    _audit["selected_radius_mm"] = radii_mm[consensus_idx]
+
+    logger.debug(
+        "_select_body_candidate: SWITCH — support=%d  rmse_ratio=%.4f  "
+        "top1_r=%.4f mm → consensus_r=%.4f mm",
+        max_support, rmse_ratio,
+        radii_mm[top1_idx], radii_mm[consensus_idx],
+    )
+    return _audit
+
+
+# ---------------------------------------------------------------------------
 # Hough + dynamic-ROI ellipse detector (one drop per call)
 # ---------------------------------------------------------------------------
 
@@ -532,6 +716,12 @@ def _detect_drop_in_roi(
         "body_start_y_global":        None,
         "n_contour_points":           None,
         "method_final":               "",
+        # Body-selector audit fields (Fix 2)
+        "body_selector_switched":         None,
+        "body_selector_support":          None,
+        "body_selector_rmse_ratio":       None,
+        "body_selector_top1_radius_mm":   None,
+        "body_selector_selected_radius_mm": None,
     }
     _best_diag_level: int = -1   # tracks deepest bodyellipse stage reached
 
@@ -963,14 +1153,20 @@ def _detect_drop_in_roi(
             _best_diag["bodyellipse_failure_reason"] = "geometry_filter_rejected"
         return None, _best_diag
 
-    best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = max(candidates, key=lambda t: t[0])
+    # ------------------------------------------------------------------
+    # 6. Select final candidate — conservative consensus override (Fix 2)
+    # ------------------------------------------------------------------
+    _selector_result = _select_body_candidate(candidates, px_to_mm)
+    best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = _selector_result["selected"]
 
     logger.debug(
-        "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f",
+        "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f  "
+        "selector_switched=%s",
         roi_label,
         best_props["center_x"], best_props["center_y"],
         best_props["major_axis"], best_props["minor_axis"],
         best_score,
+        _selector_result["switched"],
     )
 
     # Winning candidate used bodyellipse successfully
@@ -978,6 +1174,12 @@ def _detect_drop_in_roi(
     _best_diag["method_final"]            = "hough+adaptive+close+bodyellipse"
     _best_diag["bodyellipse_fit_quality"] = best_fit_quality
     _best_diag["body_start_y_global"]     = best_body_start_y_global  # winner's cut
+    # Body-selector audit (Fix 2)
+    _best_diag["body_selector_switched"]           = _selector_result["switched"]
+    _best_diag["body_selector_support"]            = _selector_result["support"]
+    _best_diag["body_selector_rmse_ratio"]         = _selector_result["rmse_ratio"]
+    _best_diag["body_selector_top1_radius_mm"]     = _selector_result["top1_radius_mm"]
+    _best_diag["body_selector_selected_radius_mm"] = _selector_result["selected_radius_mm"]
     return (best_props, best_cnt_global), _best_diag
 
 
