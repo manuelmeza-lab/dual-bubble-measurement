@@ -42,6 +42,7 @@ import pandas as pd
 from bubble_cv.calibration import calibrate
 from bubble_cv.detection import BubbleDetection, detect_bubbles
 from bubble_cv.io_utils import frame_iterator, load_image, save_csv
+from bubble_cv.temporal_qc import add_temporal_qc
 from bubble_cv.visualization import (
     plot_dual_timeseries,
     plot_binned_dual_timeseries,
@@ -593,6 +594,12 @@ def main() -> int:
 
     # ── Paso 5: Construir DataFrame ───────────────────────────────────────
     df = pd.DataFrame(results)
+
+    # ── Paso 5b: DUAL-QC temporal (metadata/diagnóstico exclusivamente) ───
+    # Opera sobre radius_eq_mm ya producido por el selector BODY (Fix 2).
+    # NO modifica tracking_valid, geometry_quality_valid ni ninguna máscara
+    # analítica (binning, R² fit, dV/dt, K).
+    df = add_temporal_qc(df)
 
     # ── Calidad del ajuste bodyellipse ────────────────────────────────────
     _print_fit_quality_audit(df)
