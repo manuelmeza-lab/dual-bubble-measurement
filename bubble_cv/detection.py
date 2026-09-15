@@ -1307,13 +1307,16 @@ def detect_bubbles(
 
     _audit = {"control": ctrl_diag, "sample": samp_diag}
 
+    # FIX 5: cada ROI sobrevive independientemente.
+    #
+    # Un fallo unilateral NO debe borrar una detección válida del lado
+    # contralateral. Los diagnósticos de ambos ROI se conservan siempre.
     if control_result is None:
         logger.error(
             "ROI [control]: detection failed — no Hough circle survived the "
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return {"control": None, "sample": None, "_audit": _audit}
 
     if sample_result is None:
         logger.error(
@@ -1321,54 +1324,74 @@ def detect_bubbles(
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return {"control": None, "sample": None, "_audit": _audit}
 
-    left_props,  left_cnt  = control_result
-    right_props, right_cnt = sample_result
-
-    # ------------------------------------------------------------------
-    # Spatial classification (unbreakable rule)
-    #
-    #   left  ROI → label = 'control'
-    #   right ROI → label = 'sample'
-    # ------------------------------------------------------------------
-    logger.debug(
-        "Spatial classification: control centroid_x=%.1f | sample centroid_x=%.1f",
-        left_props["center_x"],
-        right_props["center_x"],
-    )
+    detection_control = None
+    detection_sample = None
 
     # ------------------------------------------------------------------
-    # Build BubbleDetection objects with physical conversion
+    # Spatial classification remains fixed:
+    # left ROI -> control; right ROI -> sample.
+    # Build only the detections that actually exist.
     # ------------------------------------------------------------------
-    detection_control = _build_detection(
-        left_props,  left_cnt,  px_to_mm, label="control"
-    )
-    detection_sample  = _build_detection(
-        right_props, right_cnt, px_to_mm, label="sample"
-    )
+    if control_result is not None:
+        left_props, left_cnt = control_result
 
-    # Attach bodyellipse fit-quality fields (diagnostic only — never used in
-    # detection, filtering, scoring, measurement, or calibration)
-    for _det, _diag in ((detection_control, ctrl_diag), (detection_sample, samp_diag)):
+        logger.debug(
+            "Spatial classification: control centroid_x=%.1f",
+            left_props["center_x"],
+        )
+
+        detection_control = _build_detection(
+            left_props,
+            left_cnt,
+            px_to_mm,
+            label="control",
+        )
+
+    if sample_result is not None:
+        right_props, right_cnt = sample_result
+
+        logger.debug(
+            "Spatial classification: sample centroid_x=%.1f",
+            right_props["center_x"],
+        )
+
+        detection_sample = _build_detection(
+            right_props,
+            right_cnt,
+            px_to_mm,
+            label="sample",
+        )
+
+    # Attach bodyellipse fit-quality fields independently.
+    # Diagnostic only — never used in detection/scoring.
+    for _det, _diag in (
+        (detection_control, ctrl_diag),
+        (detection_sample, samp_diag),
+    ):
+        if _det is None:
+            continue
+
         _fq = _diag.get("bodyellipse_fit_quality", {})
-        _det.bodyellipse_fit_point_count  = _fq.get("fit_point_count")
+
+        _det.bodyellipse_fit_point_count = _fq.get("fit_point_count")
         _det.bodyellipse_contour_area_px2 = _fq.get("contour_area_px2")
         _det.bodyellipse_ellipse_area_px2 = _fq.get("ellipse_area_px2")
-        _det.bodyellipse_area_ratio       = _fq.get("area_ratio")
-        _det.bodyellipse_iou              = _fq.get("iou")
-        _det.bodyellipse_residual_mean    = _fq.get("residual_mean")
-        _det.bodyellipse_residual_rmse    = _fq.get("residual_rmse")
-        _det.bodyellipse_residual_p95     = _fq.get("residual_p95")
-        # Diagnostic fields exported to CSV (never used in detection/scoring)
+        _det.bodyellipse_area_ratio = _fq.get("area_ratio")
+        _det.bodyellipse_iou = _fq.get("iou")
+        _det.bodyellipse_residual_mean = _fq.get("residual_mean")
+        _det.bodyellipse_residual_rmse = _fq.get("residual_rmse")
+        _det.bodyellipse_residual_p95 = _fq.get("residual_p95")
+
+        # Diagnostic fields exported to CSV.
         _det.body_start_y_global = _diag.get("body_start_y_global")
-        _det.body_start_y_local  = _diag.get("body_start_y_local")
-        _det.body_max_width      = _diag.get("body_max_width")
+        _det.body_start_y_local = _diag.get("body_start_y_local")
+        _det.body_max_width = _diag.get("body_max_width")
 
     return {
         "control": detection_control,
-        "sample":  detection_sample,
-        "_audit":  _audit,
+        "sample": detection_sample,
+        "_audit": _audit,
     }
 
 # ---------------------------------------------------------------------------
