@@ -43,6 +43,7 @@ from bubble_cv.calibration import calibrate
 from bubble_cv.detection import BubbleDetection, detect_bubbles
 from bubble_cv.io_utils import frame_iterator, load_image, save_csv
 from bubble_cv.temporal_qc import add_temporal_qc
+from bubble_cv.robust_fit import _theil_sen_fit
 from bubble_cv.visualization import (
     plot_dual_timeseries,
     plot_binned_dual_timeseries,
@@ -717,9 +718,15 @@ def main() -> int:
                             s = group[col].std(ddof=1) if n > 1 else 0.0
                             row_b[f"{col}_mean"] = round(m, 4)
                             row_b[f"{col}_sd"] = round(float(s) if not pd.isna(s) else 0.0, 4)
+                            # FIX 4: mediana de radius_eq_mm2 para Theil–Sen
+                            # Almacenada con 4 decimales, que es el valor que entra al fit.
+                            if base == "radius_eq_mm2":
+                                row_b[f"{col}_median"] = round(group[col].median(), 4)
                         else:
                             row_b[f"{col}_mean"] = None
                             row_b[f"{col}_sd"] = 0.0
+                            if base == "radius_eq_mm2":
+                                row_b[f"{col}_median"] = None
                 binned_rows.append(row_b)
 
             binned_df = pd.DataFrame(binned_rows)
@@ -779,7 +786,7 @@ def main() -> int:
                 else:
                     logger.warning("[%s] Fewer than 2 valid frames — cannot fit.", lbl)
 
-            # Ajuste binned por gota
+            # Ajuste binned OLS por gota (histórico — conservar intacto)
             if binned_df is not None and not binned_df.empty:
                 b_r2_col = f"{lbl}_radius_eq_mm2_mean"
                 df_bfit = binned_df[binned_df[b_r2_col].notna()] if b_r2_col in binned_df.columns else pd.DataFrame()
@@ -793,6 +800,31 @@ def main() -> int:
                         lbl, b_slope, b_intercept, b_rsq,
                     )
 
+            # FIX 4: Ajuste robusto Theil–Sen sobre mediana de radius_eq_mm2
+            # Usa *_median ya redondeada a 4 decimales (almacenada en binned_df).
+            # NO usa DUAL-QC. NO modifica los campos OLS históricos anteriores.
+            rob_slope = rob_intercept = rob_rsq = rob_K = rob_n = None
+            if binned_df is not None and not binned_df.empty:
+                rob_col = f"{lbl}_radius_eq_mm2_median"
+                if rob_col in binned_df.columns and px_to_mm is not None:
+                    # Eliminar solo filas donde time_mean_s o la mediana no son finitos
+                    df_rob = binned_df[["time_mean_s", rob_col]].copy()
+                    df_rob = df_rob[df_rob[rob_col].notna()]
+                    if len(df_rob) >= 2:
+                        xr = df_rob["time_mean_s"].values.astype(float)
+                        yr = df_rob[rob_col].values.astype(float)
+                        ts_result = _theil_sen_fit(xr, yr)
+                        if ts_result is not None:
+                            rob_slope     = ts_result["slope"]
+                            rob_intercept = ts_result["intercept"]
+                            rob_rsq       = ts_result["r_squared"]
+                            rob_K         = ts_result["K"]
+                            rob_n         = ts_result["n_pairwise_slopes"]
+                            logger.info(
+                                "  [%s robust-TS] K=%.9f  intercept=%.9f  R²=%.9f  n_slopes=%d",
+                                lbl, rob_K, rob_intercept, rob_rsq, rob_n,
+                            )
+
             summary_rows.append({
                 "drop": lbl,
                 "input_video": video_path.name,
@@ -801,14 +833,24 @@ def main() -> int:
                 "rejected_frames": rejected,
                 "fit_start_s": round(fit_start, 4) if fit_start is not None else None,
                 "fit_end_s": round(fit_end, 4) if fit_end is not None else None,
+                # --- columnas históricas OLS raw (conservar intactas) ---
                 "slope_radius2_mm2_s": round(slope, 6) if slope is not None else None,
                 "intercept_radius2_mm2": round(intercept, 6) if intercept is not None else None,
                 "r_squared_fit": round(r_sq, 4) if r_sq is not None else None,
+                # --- columnas históricas OLS binned (conservar intactas) ---
                 "binned_slope_radius2_mm2_s": round(b_slope, 6) if b_slope is not None else None,
                 "binned_intercept_radius2_mm2": round(b_intercept, 6) if b_intercept is not None else None,
                 "binned_r_squared": round(b_rsq, 4) if b_rsq is not None else None,
                 "bin_size_s": args.bin_size_s,
                 "n_bins": n_bins,
+                # --- FIX 4: campos robustos Theil–Sen (nuevos, inequívocos) ---
+                "robust_binned_slope_radius2_mm2_s":   rob_slope,
+                "robust_binned_intercept_radius2_mm2": rob_intercept,
+                "robust_binned_r_squared":             rob_rsq,
+                "robust_binned_K_mm2_s":               rob_K,
+                "robust_binned_n_pairwise_slopes":     rob_n,
+                "robust_binned_statistic":             "median",
+                "robust_binned_fit_method":            "theil_sen_joint",
             })
 
         pd.DataFrame(summary_rows).to_csv(args.summary_output, index=False)
