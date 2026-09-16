@@ -120,6 +120,26 @@ def parse_args() -> argparse.Namespace:
         "--max-eccentricity", type=float, default=0.85,
         help="Límite de excentricidad máxima permitida (default: 0.85).",
     )
+    parser.add_argument(
+        "--control-body-start-y",
+        type=int,
+        default=None,
+        help=(
+            "Frontera física BODY fija para CONTROL, expresada como "
+            "coordenada Y global del frame en píxeles. "
+            "Si se omite, se conserva la detección automática RC3."
+        ),
+    )
+    parser.add_argument(
+        "--sample-body-start-y",
+        type=int,
+        default=None,
+        help=(
+            "Frontera física BODY fija para SAMPLE, expresada como "
+            "coordenada Y global del frame en píxeles. "
+            "Si se omite, se conserva la detección automática RC3."
+        ),
+    )
 
     # Postprocesamiento
     parser.add_argument(
@@ -841,6 +861,8 @@ def main() -> int:
             frame,
             px_to_mm=px_to_mm,
             clip_limit=args.clip_limit,
+            control_body_start_y_global=args.control_body_start_y,
+            sample_body_start_y_global=args.sample_body_start_y,
         )
 
         # Accumulate bodyellipse audit (always, even when detection fails)

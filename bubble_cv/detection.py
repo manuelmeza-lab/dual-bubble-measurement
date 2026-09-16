@@ -647,6 +647,7 @@ def _detect_drop_in_roi(
     max_major: float = 125.0,
     min_minor: float = 25.0,
     max_minor: float = 100.0,
+    fixed_body_start_y_global: int | None = None,
 ) -> "tuple[tuple[dict, np.ndarray], dict] | tuple[None, dict]":
     """Detect one pendant drop: Hough coarse localisation + ellipse fine fit.
 
@@ -700,6 +701,39 @@ def _detect_drop_in_roi(
         ``n_contour_points``, ``method_final``.
     """
     h = frame_h
+
+    # Optional physical BODY boundary.
+    #
+    # The coordinate is expressed in GLOBAL frame pixels.  None preserves
+    # the automatic RC3 neck->body / Hough-fallback behaviour unchanged.
+    # Explicit values are never silently clamped.
+    if fixed_body_start_y_global is not None:
+        if (
+            isinstance(fixed_body_start_y_global, bool)
+            or not isinstance(
+                fixed_body_start_y_global,
+                (int, np.integer),
+            )
+        ):
+            raise ValueError(
+                "fixed_body_start_y_global must be an integer "
+                "global-frame Y coordinate or None"
+            )
+
+        fixed_body_start_y_global = int(
+            fixed_body_start_y_global
+        )
+
+        if not (
+            y0
+            <= fixed_body_start_y_global
+            < y1
+        ):
+            raise ValueError(
+                "fixed_body_start_y_global must lie inside "
+                f"the ROI vertical interval [{y0}, {y1}); "
+                f"got {fixed_body_start_y_global}"
+            )
 
     # Centre-y acceptance window in global frame coordinates
     cy_min_global = int(0.06 * h)
@@ -944,7 +978,50 @@ def _detect_drop_in_roi(
                 roi_label, idx, _NECK_ROWS, len(occupied_rows),
             )
 
-        if body_start_y is None:
+        if fixed_body_start_y_global is not None:
+            # Convert the user-supplied GLOBAL physical boundary into the
+            # current dynamic-crop coordinate system.
+            fixed_body_start_y_local = (
+                fixed_body_start_y_global
+                - (y0 + dy0)
+            )
+
+            # A candidate whose dynamic crop does not contain the physical
+            # boundary cannot represent that requested measurement.  Skip it
+            # rather than clipping or moving the boundary.
+            if not (
+                0
+                <= fixed_body_start_y_local
+                < dyn_h
+            ):
+                logger.debug(
+                    "ROI [%s] circle #%d: fixed BODY boundary global y=%d "
+                    "lies outside dynamic crop global y=[%d, %d) — skipping.",
+                    roi_label,
+                    idx,
+                    fixed_body_start_y_global,
+                    y0 + dy0,
+                    y0 + dy1,
+                )
+                continue
+
+            body_start_y = int(
+                fixed_body_start_y_local
+            )
+
+            # An explicit physical boundary is not a Hough fallback.
+            used_hough_fallback = False
+
+            logger.debug(
+                "ROI [%s] circle #%d: using fixed physical BODY boundary "
+                "global y=%d -> local y=%d.",
+                roi_label,
+                idx,
+                fixed_body_start_y_global,
+                body_start_y,
+            )
+
+        elif body_start_y is None:
             used_hough_fallback = True
 
             # RC3 fallback:
@@ -1250,6 +1327,8 @@ def detect_bubbles(
     px_to_mm: float | None = None,
     blur_kernel: int = 7,
     clip_limit: float = 3.0,
+    control_body_start_y_global: int | None = None,
+    sample_body_start_y_global: int | None = None,
 ) -> dict[str, "BubbleDetection | None | dict"]:
     """Detect two simultaneous pendant drops and classify them spatially.
 
@@ -1339,6 +1418,7 @@ def detect_bubbles(
         max_major=_MAX_MAJOR,
         min_minor=_MIN_MINOR,
         max_minor=_MAX_MINOR,
+        fixed_body_start_y_global=control_body_start_y_global,
     )
 
     sample_result, samp_diag = _detect_drop_in_roi(
@@ -1359,6 +1439,7 @@ def detect_bubbles(
         max_major=_MAX_MAJOR,
         min_minor=_MIN_MINOR,
         max_minor=_MAX_MINOR,
+        fixed_body_start_y_global=sample_body_start_y_global,
     )
 
     _audit = {"control": ctrl_diag, "sample": samp_diag}
