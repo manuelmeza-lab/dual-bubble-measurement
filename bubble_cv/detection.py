@@ -597,6 +597,31 @@ def _select_body_candidate(
     return _audit
 
 
+def _select_body_candidate_pool(
+    primary_candidates: list,
+    fallback_candidates: list,
+    px_to_mm: float | None,
+) -> dict:
+    """Select from primary BODY candidates before considering fallbacks.
+
+    Fallback candidates are strictly rescue-only: they are considered only
+    when no normal neck->body candidate survives all detector filters.
+    They never compete with normal BODY candidates.
+    """
+    if primary_candidates:
+        pool = primary_candidates
+        used_fallback = False
+    elif fallback_candidates:
+        pool = fallback_candidates
+        used_fallback = True
+    else:
+        raise ValueError("at least one BODY candidate pool must be non-empty")
+
+    result = dict(_select_body_candidate(pool, px_to_mm))
+    result["used_fallback"] = used_fallback
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Hough + dynamic-ROI ellipse detector (one drop per call)
 # ---------------------------------------------------------------------------
@@ -740,7 +765,8 @@ def _detect_drop_in_roi(
     # ------------------------------------------------------------------
     # 4–5. Evaluate every Hough candidate
     # ------------------------------------------------------------------
-    candidates: list[tuple[float, dict, np.ndarray, dict]] = []  # (score, props_global, global_cnt, fit_quality)
+    primary_candidates: list[tuple] = []
+    fallback_candidates: list[tuple] = []
     rejected_shape: int = 0
 
     for idx, circle in enumerate(circles_round):
@@ -871,6 +897,7 @@ def _detect_drop_in_roi(
         _SUSTAIN_ROWS = 4
 
         body_start_y: int | None = None
+        used_hough_fallback = False
 
         # Collect the first _NECK_ROWS occupied (width > 0) row widths
         occupied_rows = [(ry, w) for ry, w in enumerate(row_widths) if w > 0]
@@ -918,20 +945,27 @@ def _detect_drop_in_roi(
             )
 
         if body_start_y is None:
-            logger.debug(
-                "ROI [%s] circle #%d: could not find body_start_y "
-                "(body_max_width=%d) — skipping.",
-                roi_label, idx, body_max_width,
-            )
-            if _best_diag_level < 2:
-                _best_diag.update({
-                    "bodyellipse_failure_reason": "body_start_not_found",
-                    "body_max_width": body_max_width,
-                })
-                _best_diag_level = 2
-            continue
+            used_hough_fallback = True
 
-        # Global y of the body start (for logging and diagnostic overlay)
+            # RC3 fallback:
+            # Hough has already localised the drop.  Failure to observe the
+            # neck->body width transition must therefore not, by itself,
+            # erase the candidate.  Use the Hough-centre row as a conservative
+            # lower-arc cutoff and retain only real contour points at/below it.
+            #
+            # hcy is expressed in fixed-ROI coordinates; dy0 is the dynamic
+            # crop origin in those same coordinates.
+            body_start_y = int(
+                np.clip(hcy - dy0, 0, dyn_h - 1)
+            )
+
+            logger.debug(
+                "ROI [%s] circle #%d: body_start_y transition not found; "
+                "using Hough-centre fallback y=%d.",
+                roi_label, idx, body_start_y,
+            )
+
+        # Global y of the body start/cutoff
         body_start_y_global = y0 + dy0 + body_start_y
 
         logger.debug(
@@ -1135,19 +1169,32 @@ def _detect_drop_in_roi(
             area_px, distance, score,
         )
 
-        candidates.append((score, props_g, global_cnt, _fit_quality, body_start_y_global))
+        candidate = (
+            score,
+            props_g,
+            global_cnt,
+            _fit_quality,
+            body_start_y_global,
+        )
+
+        if used_hough_fallback:
+            fallback_candidates.append(candidate)
+        else:
+            primary_candidates.append(candidate)
 
     # ------------------------------------------------------------------
     # 6. Select best candidate
     # ------------------------------------------------------------------
-    n_passed = len(candidates)
+    n_primary = len(primary_candidates)
+    n_fallback = len(fallback_candidates)
+    n_passed = n_primary + n_fallback
     logger.debug(
         "ROI [%s]: %d / %d Hough circle(s) passed all filters "
         "(%d rejected by shape).",
         roi_label, n_passed, n_circles, rejected_shape,
     )
 
-    if not candidates:
+    if not primary_candidates and not fallback_candidates:
         # Bodyellipse succeeded internally but every candidate was rejected
         # by the geometric filters (axis size / centre-y / edge / shape).
         if _best_diag_level == 5:
@@ -1157,7 +1204,11 @@ def _detect_drop_in_roi(
     # ------------------------------------------------------------------
     # 6. Select final candidate — conservative consensus override (Fix 2)
     # ------------------------------------------------------------------
-    _selector_result = _select_body_candidate(candidates, px_to_mm)
+    _selector_result = _select_body_candidate_pool(
+        primary_candidates=primary_candidates,
+        fallback_candidates=fallback_candidates,
+        px_to_mm=px_to_mm,
+    )
     best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = _selector_result["selected"]
 
     logger.debug(
@@ -1171,8 +1222,13 @@ def _detect_drop_in_roi(
     )
 
     # Winning candidate used bodyellipse successfully
-    _best_diag["bodyellipse_used"]        = True
-    _best_diag["method_final"]            = "hough+adaptive+close+bodyellipse"
+    _best_diag["bodyellipse_used"] = True
+    _best_diag["body_fallback_used"] = _selector_result["used_fallback"]
+    _best_diag["method_final"] = (
+        "hough+adaptive+close+bodyellipse+hough_center_fallback"
+        if _selector_result["used_fallback"]
+        else "hough+adaptive+close+bodyellipse"
+    )
     _best_diag["bodyellipse_fit_quality"] = best_fit_quality
     _best_diag["body_start_y_global"]     = best_body_start_y_global  # winner's cut
     # Body-selector audit (Fix 2)
