@@ -523,11 +523,13 @@ def _side_frame_counts(df: pd.DataFrame, side: str) -> dict:
 def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
     """Construye la máscara analítica válida de una gota de forma independiente.
 
-    Una gota es válida únicamente cuando, para ese mismo lado:
+    Una gota es analíticamente válida cuando, para ese mismo lado:
 
     * tracking_valid es True;
-    * geometry_quality_valid es True;
     * radius_eq_mm2 está disponible.
+
+    ``geometry_quality_valid`` permanece disponible como diagnóstico de
+    calidad del ajuste bodyellipse, pero no veta por sí sola una medición.
 
     La ausencia o invalidez de la gota contralateral NO participa en esta
     máscara. La validez pareada debe construirse explícitamente como la
@@ -536,18 +538,12 @@ def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
     Esta función NO usa temporal_qc_* y no modifica el DataFrame.
     """
     tracking_col = f"{side}_tracking_valid"
-    geometry_col = f"{side}_geometry_quality_valid"
     radius_col = f"{side}_radius_eq_mm2"
 
     mask = pd.Series(True, index=df.index, dtype=bool)
 
     if tracking_col in df.columns:
         mask &= df[tracking_col].eq(True)
-    else:
-        mask &= False
-
-    if geometry_col in df.columns:
-        mask &= df[geometry_col].eq(True)
     else:
         mask &= False
 
@@ -558,6 +554,67 @@ def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
         mask &= False
 
     return mask
+
+
+# ---------------------------------------------------------------------------
+# Paired analytical validity — FIX 7
+# ---------------------------------------------------------------------------
+
+def _paired_valid_mask(df: pd.DataFrame) -> pd.Series:
+    """Intersección de las validades analíticas de ambas gotas.
+
+    La validez pareada no introduce un QC adicional. En particular,
+    ``geometry_quality_valid`` permanece como diagnóstico y no actúa
+    como veto analítico independiente.
+    """
+    return (
+        _side_valid_mask(df, "control")
+        & _side_valid_mask(df, "sample")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Independent per-side evaporation rate — FIX 7
+# ---------------------------------------------------------------------------
+
+def _compute_side_evaporation_rate(
+    df: pd.DataFrame,
+    side: str,
+) -> pd.Series:
+    """Calcula dV/dt usando la validez analítica central del propio lado.
+
+    ``geometry_quality_valid`` permanece disponible como diagnóstico del
+    ajuste bodyellipse, pero no veta por sí sola una medición.
+    """
+    vol_col = f"{side}_volume_mm3"
+    out_col = f"{side}_evap_rate_mm3_s"
+
+    out = pd.Series(
+        np.nan,
+        index=df.index,
+        name=out_col,
+        dtype=float,
+    )
+
+    if vol_col not in df.columns:
+        return out
+
+    volume = pd.to_numeric(df[vol_col], errors="coerce")
+    mask = _side_valid_mask(df, side) & volume.notna()
+    df_valid = df.loc[mask].copy()
+
+    if len(df_valid) <= 1:
+        return out
+
+    rates = compute_evaporation_rate(
+        df_valid,
+        time_col="timestamp_s",
+        vol_col=vol_col,
+        out_col=out_col,
+    )
+
+    out.loc[rates.index] = rates
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -936,30 +993,12 @@ def main() -> int:
                     df[col] = temporal_smooth(df[col], args.smooth)
 
     # ── Paso 7: Tasas de evaporación independientes (dV/dt) ───────────────
+    # FIX 7: usar la misma máscara analítica central que binning y fits.
+    # geometry_quality_valid se conserva como diagnóstico y no actúa aquí
+    # como censor independiente.
     for lbl in LABELS:
-        vol_col = f"{lbl}_volume_mm3"
-        valid_col = f"{lbl}_tracking_valid"
         out_col = f"{lbl}_evap_rate_mm3_s"
-
-        if vol_col in df.columns and df[vol_col].notna().any():
-            # Filtrar por tracking_valid Y geometry_quality_valid
-            _geom_col = f"{lbl}_geometry_quality_valid"
-            _evap_mask = df[valid_col] == True
-            if _geom_col in df.columns:
-                _evap_mask &= (df[_geom_col] == True)
-            df_valid = df[_evap_mask].copy()
-            if len(df_valid) > 1:
-                rates = compute_evaporation_rate(
-                    df_valid,
-                    time_col="timestamp_s",
-                    vol_col=vol_col,
-                    out_col=out_col,
-                )
-                df[out_col] = rates.reindex(df.index)
-            else:
-                df[out_col] = None
-        else:
-            df[out_col] = None
+        df[out_col] = _compute_side_evaporation_rate(df, lbl)
 
     # ── Paso 8: Exportar CSV pareado ──────────────────────────────────────
     df.to_csv(args.output, index=False)
@@ -979,13 +1018,10 @@ def main() -> int:
     if args.bin_size_s is not None and args.bin_size_s > 0.0:
         logger.info("Performing binned analysis (bin=%.2fs)...", args.bin_size_s)
 
-        # Usar solo filas donde AMBAS gotas son válidas (tracking Y calidad geométrica)
-        both_valid = (
-            (df.get("control_tracking_valid", True) == True)
-            & (df.get("sample_tracking_valid", True) == True)
-            & (df.get("control_geometry_quality_valid", True) == True)
-            & (df.get("sample_geometry_quality_valid", True) == True)
-        )
+        # FIX 7: la validez pareada es exclusivamente la intersección
+        # de las validades analíticas individuales. El RMSE bodyellipse
+        # permanece como diagnóstico y no introduce un veto adicional.
+        both_valid = _paired_valid_mask(df)
         df_qc = df[both_valid].copy()
 
         if not df_qc.empty:

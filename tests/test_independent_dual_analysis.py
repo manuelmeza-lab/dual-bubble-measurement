@@ -28,12 +28,12 @@ class TestIndependentDualAnalysisContract(unittest.TestCase):
         #   ausente en 5
         #
         # SAMPLE:
-        #   válido en 0,1,4,5
+        #   analíticamente válido en 0,1,3,4,5
         #   ausente en 2
-        #   geometría rechazada en 3
+        #   RMSE diagnóstico rechazado en 3, sin veto analítico
         #
         # Intersección válida:
-        #   0,1,4
+        #   0,1,3,4
         self.df = pd.DataFrame({
             "timestamp_s": [0., 1., 2., 3., 4., 5.],
 
@@ -65,7 +65,7 @@ class TestIndependentDualAnalysisContract(unittest.TestCase):
 
         self.assertEqual(
             mask.tolist(),
-            [True, True, False, False, True, True],
+            [True, True, False, True, True, True],
         )
 
     def test_03_paired_validity_is_intersection(self):
@@ -76,7 +76,7 @@ class TestIndependentDualAnalysisContract(unittest.TestCase):
 
         self.assertEqual(
             paired.tolist(),
-            [True, True, False, False, True, False],
+            [True, True, False, True, True, False],
         )
 
     def test_04_sample_failure_does_not_remove_control(self):
@@ -87,14 +87,15 @@ class TestIndependentDualAnalysisContract(unittest.TestCase):
         self.assertTrue(bool(ctrl.iloc[2]))
         self.assertFalse(bool(samp.iloc[2]))
 
-    def test_05_geometry_rejection_is_side_specific(self):
+    def test_05_geometry_diagnostic_does_not_veto_measurement(self):
         ctrl = _side_valid_mask(self.df, "control")
         samp = _side_valid_mask(self.df, "sample")
 
-        # t=3: SAMPLE tiene medición pero falla geometry QC.
-        # CONTROL no debe verse afectado.
+        # t=3: SAMPLE tiene medición y tracking válido.
+        # geometry_quality_valid=False se conserva como diagnóstico,
+        # pero no veta la medición de SAMPLE ni afecta CONTROL.
         self.assertTrue(bool(ctrl.iloc[3]))
-        self.assertFalse(bool(samp.iloc[3]))
+        self.assertTrue(bool(samp.iloc[3]))
 
     def test_06_independent_counts_differ_from_paired_count(self):
         ctrl = _side_valid_mask(self.df, "control")
@@ -102,8 +103,8 @@ class TestIndependentDualAnalysisContract(unittest.TestCase):
         paired = ctrl & samp
 
         self.assertEqual(int(ctrl.sum()), 5)
-        self.assertEqual(int(samp.sum()), 4)
-        self.assertEqual(int(paired.sum()), 3)
+        self.assertEqual(int(samp.sum()), 5)
+        self.assertEqual(int(paired.sum()), 4)
 
 
 
@@ -224,17 +225,17 @@ class TestIndependentFrameCounts(unittest.TestCase):
         self.assertEqual(counts["qc_rejected_frames"], 0)
         self.assertEqual(counts["unusable_frames"], 1)
 
-    def test_11_sample_counts_separate_missing_from_qc_rejection(self):
+    def test_11_sample_counts_keep_rmse_as_diagnostic(self):
         from analyze_video import _side_frame_counts
 
         counts = _side_frame_counts(self.df, "sample")
 
         self.assertEqual(counts["total_frames"], 6)
         self.assertEqual(counts["detected_frames"], 5)
-        self.assertEqual(counts["valid_frames"], 4)
+        self.assertEqual(counts["valid_frames"], 5)
         self.assertEqual(counts["missing_frames"], 1)
-        self.assertEqual(counts["qc_rejected_frames"], 1)
-        self.assertEqual(counts["unusable_frames"], 2)
+        self.assertEqual(counts["qc_rejected_frames"], 0)
+        self.assertEqual(counts["unusable_frames"], 1)
 
 
 
@@ -244,11 +245,11 @@ class TestIndependentBinning(unittest.TestCase):
         # Dos bins de 10 s.
         #
         # CONTROL válido: t=0,1,2,10,11
-        # SAMPLE válido:  t=0,1,10
+        # SAMPLE válido:  t=0,1,10,11
         #
         # t=2 demuestra que un SAMPLE ausente no debe quitar CONTROL.
-        # t=11 demuestra que un SAMPLE geométricamente rechazado tampoco
-        # debe quitar CONTROL.
+        # t=11 demuestra que geometry_quality_valid=False permanece como
+        # diagnóstico y no elimina SAMPLE ni CONTROL del análisis.
         self.df = pd.DataFrame({
             "timestamp_s": [0., 1., 2., 10., 11.],
 
@@ -298,11 +299,11 @@ class TestIndependentBinning(unittest.TestCase):
         )
 
         self.assertEqual(out["bin_id"].tolist(), [0, 1])
-        self.assertEqual(out["n_points"].tolist(), [2, 1])
+        self.assertEqual(out["n_points"].tolist(), [2, 2])
 
         self.assertEqual(
             out["sample_radius_eq_mm2_median"].tolist(),
-            [1.295, 1.2],
+            [1.295, 1.35],
         )
 
     def test_14_median_is_rounded_to_four_decimals_before_fit(self):
