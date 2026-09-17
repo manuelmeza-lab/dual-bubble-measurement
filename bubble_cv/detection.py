@@ -132,6 +132,20 @@ class BubbleDetection:
     geometry_quality_valid:            bool = True
     geometry_quality_rejection_reason: str  = ""
 
+    # ---- Contour-consensus QC (Fix 8) ---------------------------------------
+    # Independent geometric QC of the physical contour selected by RC4.
+    #
+    # This flag NEVER replaces or modifies the measured ellipse/radius.
+    # Real detections overwrite these defaults immediately after construction.
+    # Defaults preserve backwards compatibility for manually constructed
+    # BubbleDetection objects used by historical tests/tools.
+    contour_consensus_applicable: bool = False
+    contour_consensus_valid: bool = True
+    contour_consensus_support_fraction: float | None = None
+    contour_consensus_n_inliers: int | None = None
+    contour_consensus_n_points: int | None = None
+    contour_consensus_rejection_reason: str = ""
+
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
         return {
@@ -171,6 +185,19 @@ class BubbleDetection:
             # ---- Geometry quality gate -------------------------------------
             "geometry_quality_valid":            self.geometry_quality_valid,
             "geometry_quality_rejection_reason": self.geometry_quality_rejection_reason,
+            # ---- Contour-consensus QC (Fix 8) ------------------------------
+            "contour_consensus_applicable": self.contour_consensus_applicable,
+            "contour_consensus_valid": self.contour_consensus_valid,
+            "contour_consensus_support_fraction": (
+                round(self.contour_consensus_support_fraction, 4)
+                if self.contour_consensus_support_fraction is not None
+                else None
+            ),
+            "contour_consensus_n_inliers": self.contour_consensus_n_inliers,
+            "contour_consensus_n_points": self.contour_consensus_n_points,
+            "contour_consensus_rejection_reason": (
+                self.contour_consensus_rejection_reason
+            ),
         }
 
 
@@ -281,6 +308,427 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
         "eccentricity": eccentricity(semi_major, semi_minor),
         "equiv_diameter_px": equivalent_diameter(semi_major, semi_minor),
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Contour-consensus QC (Fix 8)
+# ---------------------------------------------------------------------------
+#
+# Independent post-detection geometry diagnostic.
+#
+# IMPORTANT:
+# * Does NOT replace the RC4 ellipse.
+# * Does NOT change radius_eq_mm2 or any physical measurement.
+# * Does NOT alter candidate selection.
+# * Uses only the physical contour already selected by RC4.
+#
+# Purpose:
+# Ask whether at least half of the selected contour points can support one
+# geometrically plausible ellipse within a 2 px radial tolerance.
+#
+# The constants below are intentionally frozen for this validation branch.
+# They come from the diagnostic protocol evaluated on V1/V2/V3 and are NOT
+# tuned against K or R².
+
+_CONTOUR_CONSENSUS_THRESHOLD_PX: float = 2.0
+_CONTOUR_CONSENSUS_MIN_FRACTION: float = 0.50
+_CONTOUR_CONSENSUS_MAX_ITERATIONS: int = 3000
+_CONTOUR_CONSENSUS_SEED: int = 20260916
+
+# High-confidence early exit.
+# This affects runtime only; the scientific/QC acceptance threshold remains
+# 0.50. Borderline cases continue through the full RANSAC search.
+_CONTOUR_CONSENSUS_EARLY_FRACTION: float = 0.80
+
+
+def _contour_consensus_residual_px(
+    points: np.ndarray,
+    props: dict,
+) -> np.ndarray:
+    """Approximate radial point-to-ellipse residual in pixels."""
+
+    pts = np.asarray(
+        points,
+        dtype=float,
+    ).reshape(-1, 2)
+
+    cx = props["center_x"]
+    cy = props["center_y"]
+
+    a = props["semi_major"]
+    b = props["semi_minor"]
+
+    if a <= 0.0 or b <= 0.0:
+        return np.full(
+            len(pts),
+            np.inf,
+            dtype=float,
+        )
+
+    theta = math.radians(
+        props["angle_deg"]
+    )
+
+    ct = math.cos(theta)
+    st = math.sin(theta)
+
+    dx = pts[:, 0] - cx
+    dy = pts[:, 1] - cy
+
+    x = dx * ct + dy * st
+    y = -dx * st + dy * ct
+
+    rho = np.sqrt(
+        x * x + y * y
+    )
+
+    phi = np.arctan2(
+        y,
+        x,
+    )
+
+    denom = np.sqrt(
+        (np.cos(phi) ** 2) / (a * a)
+        +
+        (np.sin(phi) ** 2) / (b * b)
+    )
+
+    radius_ellipse = (
+        1.0 / denom
+    )
+
+    return np.abs(
+        rho - radius_ellipse
+    )
+
+
+def _contour_consensus_props_plausible(
+    props: dict | None,
+) -> bool:
+    """Apply the same basic ellipse-size/shape domain used by RC4."""
+
+    if props is None:
+        return False
+
+    major = props["major_axis"]
+    minor = props["minor_axis"]
+
+    if not (
+        35.0 <= major <= 125.0
+    ):
+        return False
+
+    if not (
+        25.0 <= minor <= 100.0
+    ):
+        return False
+
+    if major <= 0.0:
+        return False
+
+    if minor / major < 0.65:
+        return False
+
+    return True
+
+
+def _contour_consensus_refine(
+    points: np.ndarray,
+    initial_inliers: np.ndarray,
+    threshold_px: float,
+) -> tuple[dict | None, np.ndarray]:
+    """Refine a RANSAC consensus using the same 3-step protocol as dry-run."""
+
+    pts = np.asarray(
+        points,
+        dtype=np.float32,
+    ).reshape(-1, 2)
+
+    inliers = np.asarray(
+        initial_inliers,
+        dtype=bool,
+    ).copy()
+
+    props = None
+
+    for _ in range(3):
+
+        if int(inliers.sum()) < 5:
+            break
+
+        consensus = (
+            pts[inliers]
+            .reshape(-1, 1, 2)
+            .astype(np.float32)
+        )
+
+        try:
+            candidate = _fit_single_ellipse(
+                consensus
+            )
+        except cv2.error:
+            break
+
+        if not _contour_consensus_props_plausible(
+            candidate
+        ):
+            break
+
+        residual = _contour_consensus_residual_px(
+            pts,
+            candidate,
+        )
+
+        new_inliers = (
+            residual <= threshold_px
+        )
+
+        props = candidate
+
+        if np.array_equal(
+            new_inliers,
+            inliers,
+        ):
+            inliers = new_inliers
+            break
+
+        inliers = new_inliers
+
+    if int(inliers.sum()) < 5:
+        return None, inliers
+
+    consensus = (
+        pts[inliers]
+        .reshape(-1, 1, 2)
+        .astype(np.float32)
+    )
+
+    try:
+        final_props = _fit_single_ellipse(
+            consensus
+        )
+    except cv2.error:
+        return None, inliers
+
+    if not _contour_consensus_props_plausible(
+        final_props
+    ):
+        return None, inliers
+
+    residual = _contour_consensus_residual_px(
+        pts,
+        final_props,
+    )
+
+    final_inliers = (
+        residual <= threshold_px
+    )
+
+    return final_props, final_inliers
+
+
+def _contour_consensus_qc(
+    contour: np.ndarray,
+    threshold_px: float = _CONTOUR_CONSENSUS_THRESHOLD_PX,
+    min_fraction: float = _CONTOUR_CONSENSUS_MIN_FRACTION,
+    max_iterations: int = _CONTOUR_CONSENSUS_MAX_ITERATIONS,
+) -> dict:
+    """Return deterministic RANSAC contour-consensus QC diagnostics.
+
+    This is a diagnostic/quality-control operation only.  It never replaces
+    the RC4 ellipse or its measured values.
+
+    Returns
+    -------
+    dict
+        valid
+            True when a plausible ellipse is supported by at least
+            ``min_fraction`` of the physical contour points.
+
+        support_fraction
+            Fraction of contour points supporting the final consensus ellipse.
+
+        n_inliers
+            Number of supporting points.
+
+        n_points
+            Total number of physical contour points.
+
+        reason
+            Empty on pass; explicit failure reason otherwise.
+    """
+
+    pts = np.asarray(
+        contour,
+        dtype=np.float32,
+    ).reshape(-1, 2)
+
+    n_points = len(pts)
+
+    if n_points < 5:
+        return {
+            "valid": False,
+            "support_fraction": 0.0,
+            "n_inliers": 0,
+            "n_points": n_points,
+            "reason": "fewer_than_5_points",
+        }
+
+    rng = np.random.default_rng(
+        _CONTOUR_CONSENSUS_SEED
+    )
+
+    required = int(
+        math.ceil(
+            min_fraction * n_points
+        )
+    )
+
+    early_required = int(
+        math.ceil(
+            _CONTOUR_CONSENSUS_EARLY_FRACTION
+            * n_points
+        )
+    )
+
+    best_score = None
+    best_inliers = None
+
+    for _ in range(
+        max_iterations
+    ):
+
+        idx = rng.choice(
+            n_points,
+            size=5,
+            replace=False,
+        )
+
+        sample = (
+            pts[idx]
+            .reshape(-1, 1, 2)
+            .astype(np.float32)
+        )
+
+        try:
+            props = _fit_single_ellipse(
+                sample
+            )
+        except cv2.error:
+            continue
+
+        if not _contour_consensus_props_plausible(
+            props
+        ):
+            continue
+
+        residual = _contour_consensus_residual_px(
+            pts,
+            props,
+        )
+
+        inliers = (
+            residual <= threshold_px
+        )
+
+        n_inliers = int(
+            inliers.sum()
+        )
+
+        if n_inliers < 5:
+            continue
+
+        median_residual = float(
+            np.median(
+                residual[inliers]
+            )
+        )
+
+        score = (
+            n_inliers,
+            -median_residual,
+        )
+
+        if (
+            best_score is None
+            or score > best_score
+        ):
+            best_score = score
+            best_inliers = inliers.copy()
+
+        # Runtime optimisation only:
+        # confirm a clearly high-consensus candidate after refinement,
+        # then stop.  Borderline cases are never early-accepted.
+        if n_inliers >= early_required:
+
+            _, refined_inliers = (
+                _contour_consensus_refine(
+                    pts,
+                    inliers,
+                    threshold_px,
+                )
+            )
+
+            refined_count = int(
+                refined_inliers.sum()
+            )
+
+            if refined_count >= early_required:
+
+                return {
+                    "valid": True,
+                    "support_fraction":
+                        refined_count / n_points,
+                    "n_inliers":
+                        refined_count,
+                    "n_points":
+                        n_points,
+                    "reason":
+                        "",
+                }
+
+    if best_inliers is None:
+        return {
+            "valid": False,
+            "support_fraction": 0.0,
+            "n_inliers": 0,
+            "n_points": n_points,
+            "reason": "no_plausible_model",
+        }
+
+    _, final_inliers = (
+        _contour_consensus_refine(
+            pts,
+            best_inliers,
+            threshold_px,
+        )
+    )
+
+    final_count = int(
+        final_inliers.sum()
+    )
+
+    support_fraction = (
+        final_count / n_points
+    )
+
+    valid = (
+        final_count >= required
+    )
+
+    return {
+        "valid": valid,
+        "support_fraction": support_fraction,
+        "n_inliers": final_count,
+        "n_points": n_points,
+        "reason": (
+            ""
+            if valid
+            else "low_consensus"
+        ),
+    }
+
 
 
 def _build_detection(
@@ -1502,12 +1950,63 @@ def detect_bubbles(
 
     # Attach bodyellipse fit-quality fields independently.
     # Diagnostic only — never used in detection/scoring.
-    for _det, _diag in (
-        (detection_control, ctrl_diag),
-        (detection_sample, samp_diag),
+    for _det, _diag, _fixed_body_y in (
+        (
+            detection_control,
+            ctrl_diag,
+            control_body_start_y_global,
+        ),
+        (
+            detection_sample,
+            samp_diag,
+            sample_body_start_y_global,
+        ),
     ):
         if _det is None:
             continue
+
+        # FIX 8: contour-consensus QC.
+        #
+        # Operates only on the physical contour already selected by RC4.
+        # It does NOT refit/replace the production ellipse and does NOT
+        # modify any measured geometric or physical quantity.
+        #
+        # Historical wiring tests use lightweight mock detections
+        # (SimpleNamespace) that predate the contour contract.  Those mocks
+        # must preserve their historical behaviour.  Every real
+        # BubbleDetection has a ``contour`` attribute and therefore enters
+        # the Fix 8 QC normally.
+        # Fix 8 is applicable only when this side uses an explicit
+        # physical BODY boundary.  Automatic BODY keeps RC4 semantics.
+        _consensus_applicable = (
+            _fixed_body_y is not None
+            and hasattr(_det, "contour")
+        )
+
+        _det.contour_consensus_applicable = bool(
+            _consensus_applicable
+        )
+
+        if _consensus_applicable:
+            _consensus = _contour_consensus_qc(
+                _det.contour
+            )
+
+            _det.contour_consensus_valid = bool(
+                _consensus["valid"]
+            )
+            _det.contour_consensus_support_fraction = float(
+                _consensus["support_fraction"]
+            )
+            _det.contour_consensus_n_inliers = int(
+                _consensus["n_inliers"]
+            )
+            _det.contour_consensus_n_points = int(
+                _consensus["n_points"]
+            )
+            _det.contour_consensus_rejection_reason = str(
+                _consensus["reason"]
+            )
 
         _fq = _diag.get("bodyellipse_fit_quality", {})
 

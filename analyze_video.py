@@ -546,10 +546,17 @@ def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
     Una gota es analíticamente válida cuando, para ese mismo lado:
 
     * tracking_valid es True;
-    * radius_eq_mm2 está disponible.
+    * radius_eq_mm2 está disponible;
+    * contour consensus no veta, salvo cuando
+      contour_consensus_applicable es True y contour_consensus_valid es False.
 
     ``geometry_quality_valid`` permanece disponible como diagnóstico de
     calidad del ajuste bodyellipse, pero no veta por sí sola una medición.
+
+    ``contour_consensus_valid`` (Fix 8) es un veto geométrico independiente
+    únicamente cuando ``contour_consensus_applicable`` es True:
+    no modifica ni reemplaza la medición original. DataFrames históricos sin
+    esta columna conservan exactamente la semántica previa.
 
     La ausencia o invalidez de la gota contralateral NO participa en esta
     máscara. La validez pareada debe construirse explícitamente como la
@@ -572,6 +579,30 @@ def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
         mask &= radius.notna()
     else:
         mask &= False
+
+    # FIX 8: contour-consensus QC is an independent analytical veto.
+    #
+    # Backwards compatibility:
+    # historical DataFrames that predate Fix 8 do not contain this column
+    # and therefore retain their original analytical-validity semantics.
+    applicable_col = f"{side}_contour_consensus_applicable"
+    consensus_col = f"{side}_contour_consensus_valid"
+
+    # Fix 8 vetoes only measurements for which contour consensus is
+    # explicitly applicable (currently: explicit fixed BODY boundary).
+    #
+    # Automatic BODY and historical DataFrames preserve RC4 semantics.
+    if (
+        applicable_col in df.columns
+        and consensus_col in df.columns
+    ):
+        applicable = df[applicable_col].eq(True)
+        consensus_valid = df[consensus_col].eq(True)
+
+        mask &= (
+            ~applicable
+            | consensus_valid
+        )
 
     return mask
 
