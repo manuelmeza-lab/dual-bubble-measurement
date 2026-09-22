@@ -42,6 +42,8 @@ import pandas as pd
 from bubble_cv.calibration import calibrate
 from bubble_cv.detection import BubbleDetection, detect_bubbles
 from bubble_cv.io_utils import frame_iterator, load_image, save_csv
+from bubble_cv.temporal_qc import add_temporal_qc
+from bubble_cv.robust_fit import _theil_sen_fit
 from bubble_cv.visualization import (
     plot_dual_timeseries,
     plot_binned_dual_timeseries,
@@ -117,6 +119,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-eccentricity", type=float, default=0.85,
         help="Límite de excentricidad máxima permitida (default: 0.85).",
+    )
+    parser.add_argument(
+        "--control-body-start-y",
+        type=int,
+        default=None,
+        help=(
+            "Frontera física BODY fija para CONTROL, expresada como "
+            "coordenada Y global del frame en píxeles. "
+            "Si se omite, se conserva la detección automática RC3."
+        ),
+    )
+    parser.add_argument(
+        "--sample-body-start-y",
+        type=int,
+        default=None,
+        help=(
+            "Frontera física BODY fija para SAMPLE, expresada como "
+            "coordenada Y global del frame en píxeles. "
+            "Si se omite, se conserva la detección automática RC3."
+        ),
     )
 
     # Postprocesamiento
@@ -312,6 +334,338 @@ def _prefixed_dict(detection: BubbleDetection, label: str) -> dict:
     raw = detection.to_dict()
     # Excluir 'label' del dict porque ya está codificado en el prefijo
     return {f"{label}_{k}": v for k, v in raw.items() if k != "label"}
+
+
+# ---------------------------------------------------------------------------
+# Independent frame persistence — FIX 5
+# ---------------------------------------------------------------------------
+
+def _build_independent_frame_row(
+    frame_num: int,
+    timestamp_s: float,
+    ctrl_det=None,
+    samp_det=None,
+) -> dict:
+    """Construye una fila conservando cada detección de forma independiente.
+
+    La fila existe aunque una o ambas gotas estén ausentes. Una detección
+    presente aporta sus columnas prefijadas; una detección ausente no genera
+    medidas geométricas ficticias.
+
+    Los campos *_detected describen exclusivamente disponibilidad de la
+    detección y NO sustituyen tracking_valid ni geometry_quality_valid.
+    """
+    row: dict = {
+        "frame_id": frame_num,
+        "timestamp_s": round(timestamp_s, 4),
+        "control_detected": ctrl_det is not None,
+        "sample_detected": samp_det is not None,
+    }
+
+    if ctrl_det is not None:
+        row.update(_prefixed_dict(ctrl_det, "control"))
+
+    if samp_det is not None:
+        row.update(_prefixed_dict(samp_det, "sample"))
+
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Independent per-side binning — FIX 5
+# ---------------------------------------------------------------------------
+
+def _bin_side_independently(
+    df: pd.DataFrame,
+    side: str,
+    bin_size_s: float,
+) -> pd.DataFrame:
+    """Agrupa una gota usando exclusivamente su propia validez analítica.
+
+    Conserva la semántica estadística del binning histórico:
+
+    * bin_id = floor(timestamp_s / bin_size_s);
+    * time_mean_s = media de timestamps válidos del bin, redondeada a 4;
+    * n_points = número de observaciones válidas del lado;
+    * media y SD (ddof=1) de las métricas históricas;
+    * SD = 0.0 cuando el bin contiene un único punto;
+    * mediana de radius_eq_mm2 redondeada a 4 decimales antes del fit.
+
+    No aplica temporal_qc_* y no utiliza información de la gota contralateral.
+    No impone un mínimo nuevo de puntos por bin.
+    """
+    if bin_size_s <= 0.0:
+        raise ValueError("bin_size_s must be > 0")
+
+    mask_valid = _side_valid_mask(df, side)
+    df_side = df[mask_valid].copy()
+
+    columns = [
+        "bin_id",
+        "time_start_s",
+        "time_end_s",
+        "time_mean_s",
+        "n_points",
+    ]
+
+    metrics = [
+        "equiv_diameter_mm",
+        "volume_mm3",
+        "radius_eq_mm",
+        "radius_eq_mm2",
+        "eccentricity",
+    ]
+
+    for base in metrics:
+        col = f"{side}_{base}"
+        columns.extend([
+            f"{col}_mean",
+            f"{col}_sd",
+        ])
+        if base == "radius_eq_mm2":
+            columns.append(f"{col}_median")
+
+    if df_side.empty:
+        return pd.DataFrame(columns=columns)
+
+    df_side["bin_id"] = (
+        df_side["timestamp_s"] // bin_size_s
+    ).astype(int)
+
+    binned_rows: list[dict] = []
+
+    for bin_id, group in df_side.groupby("bin_id"):
+        n = len(group)
+
+        row_b: dict = {
+            "bin_id": int(bin_id),
+            "time_start_s": round(bin_id * bin_size_s, 4),
+            "time_end_s": round((bin_id + 1) * bin_size_s, 4),
+            "time_mean_s": round(group["timestamp_s"].mean(), 4),
+            "n_points": n,
+        }
+
+        for base in metrics:
+            col = f"{side}_{base}"
+
+            if col in group.columns and group[col].notna().any():
+                values = pd.to_numeric(
+                    group[col],
+                    errors="coerce",
+                ).dropna()
+
+                if not values.empty:
+                    mean_value = values.mean()
+                    sd_value = (
+                        values.std(ddof=1)
+                        if len(values) > 1
+                        else 0.0
+                    )
+
+                    row_b[f"{col}_mean"] = round(
+                        float(mean_value),
+                        4,
+                    )
+                    row_b[f"{col}_sd"] = round(
+                        float(sd_value)
+                        if not pd.isna(sd_value)
+                        else 0.0,
+                        4,
+                    )
+
+                    if base == "radius_eq_mm2":
+                        row_b[f"{col}_median"] = round(
+                            float(values.median()),
+                            4,
+                        )
+                    continue
+
+            row_b[f"{col}_mean"] = None
+            row_b[f"{col}_sd"] = 0.0
+
+            if base == "radius_eq_mm2":
+                row_b[f"{col}_median"] = None
+
+        binned_rows.append(row_b)
+
+    return pd.DataFrame(binned_rows, columns=columns)
+
+
+# ---------------------------------------------------------------------------
+# Independent per-side frame counts — FIX 5
+# ---------------------------------------------------------------------------
+
+def _side_frame_counts(df: pd.DataFrame, side: str) -> dict:
+    """Resume detección y validez analítica para una gota independientemente.
+
+    Distingue entre:
+
+    * total_frames: todos los timestamps intentados;
+    * detected_frames: frames donde el detector produjo esa gota;
+    * valid_frames: detecciones que pasan la máscara analítica del lado;
+    * missing_frames: frames sin detección para ese lado;
+    * qc_rejected_frames: detectados pero no analíticamente válidos;
+    * unusable_frames: todos los frames que no aportan al análisis del lado.
+
+    La gota contralateral no participa en ninguna de estas cantidades.
+    """
+    total_frames = len(df)
+    detected_col = f"{side}_detected"
+
+    if detected_col in df.columns:
+        detected_mask = df[detected_col].eq(True)
+    else:
+        detected_mask = pd.Series(False, index=df.index, dtype=bool)
+
+    valid_mask = _side_valid_mask(df, side)
+
+    detected_frames = int(detected_mask.sum())
+    valid_frames = int(valid_mask.sum())
+
+    missing_frames = total_frames - detected_frames
+    qc_rejected_frames = int((detected_mask & ~valid_mask).sum())
+    unusable_frames = total_frames - valid_frames
+
+    return {
+        "total_frames": total_frames,
+        "detected_frames": detected_frames,
+        "valid_frames": valid_frames,
+        "missing_frames": missing_frames,
+        "qc_rejected_frames": qc_rejected_frames,
+        "unusable_frames": unusable_frames,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Independent per-side validity mask — FIX 5
+# ---------------------------------------------------------------------------
+
+def _side_valid_mask(df: pd.DataFrame, side: str) -> pd.Series:
+    """Construye la máscara analítica válida de una gota de forma independiente.
+
+    Una gota es analíticamente válida cuando, para ese mismo lado:
+
+    * tracking_valid es True;
+    * radius_eq_mm2 está disponible;
+    * contour consensus no veta, salvo cuando
+      contour_consensus_applicable es True y contour_consensus_valid es False.
+
+    ``geometry_quality_valid`` permanece disponible como diagnóstico de
+    calidad del ajuste bodyellipse, pero no veta por sí sola una medición.
+
+    ``contour_consensus_valid`` (Fix 8) es un veto geométrico independiente
+    únicamente cuando ``contour_consensus_applicable`` es True:
+    no modifica ni reemplaza la medición original. DataFrames históricos sin
+    esta columna conservan exactamente la semántica previa.
+
+    La ausencia o invalidez de la gota contralateral NO participa en esta
+    máscara. La validez pareada debe construirse explícitamente como la
+    intersección de las máscaras individuales.
+
+    Esta función NO usa temporal_qc_* y no modifica el DataFrame.
+    """
+    tracking_col = f"{side}_tracking_valid"
+    radius_col = f"{side}_radius_eq_mm2"
+
+    mask = pd.Series(True, index=df.index, dtype=bool)
+
+    if tracking_col in df.columns:
+        mask &= df[tracking_col].eq(True)
+    else:
+        mask &= False
+
+    if radius_col in df.columns:
+        radius = pd.to_numeric(df[radius_col], errors="coerce")
+        mask &= radius.notna()
+    else:
+        mask &= False
+
+    # FIX 8: contour-consensus QC is an independent analytical veto.
+    #
+    # Backwards compatibility:
+    # historical DataFrames that predate Fix 8 do not contain this column
+    # and therefore retain their original analytical-validity semantics.
+    applicable_col = f"{side}_contour_consensus_applicable"
+    consensus_col = f"{side}_contour_consensus_valid"
+
+    # Fix 8 vetoes only measurements for which contour consensus is
+    # explicitly applicable (currently: explicit fixed BODY boundary).
+    #
+    # Automatic BODY and historical DataFrames preserve RC4 semantics.
+    if (
+        applicable_col in df.columns
+        and consensus_col in df.columns
+    ):
+        applicable = df[applicable_col].eq(True)
+        consensus_valid = df[consensus_col].eq(True)
+
+        mask &= (
+            ~applicable
+            | consensus_valid
+        )
+
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Paired analytical validity — FIX 7
+# ---------------------------------------------------------------------------
+
+def _paired_valid_mask(df: pd.DataFrame) -> pd.Series:
+    """Intersección de las validades analíticas de ambas gotas.
+
+    La validez pareada no introduce un QC adicional. En particular,
+    ``geometry_quality_valid`` permanece como diagnóstico y no actúa
+    como veto analítico independiente.
+    """
+    return (
+        _side_valid_mask(df, "control")
+        & _side_valid_mask(df, "sample")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Independent per-side evaporation rate — FIX 7
+# ---------------------------------------------------------------------------
+
+def _compute_side_evaporation_rate(
+    df: pd.DataFrame,
+    side: str,
+) -> pd.Series:
+    """Calcula dV/dt usando la validez analítica central del propio lado.
+
+    ``geometry_quality_valid`` permanece disponible como diagnóstico del
+    ajuste bodyellipse, pero no veta por sí sola una medición.
+    """
+    vol_col = f"{side}_volume_mm3"
+    out_col = f"{side}_evap_rate_mm3_s"
+
+    out = pd.Series(
+        np.nan,
+        index=df.index,
+        name=out_col,
+        dtype=float,
+    )
+
+    if vol_col not in df.columns:
+        return out
+
+    volume = pd.to_numeric(df[vol_col], errors="coerce")
+    mask = _side_valid_mask(df, side) & volume.notna()
+    df_valid = df.loc[mask].copy()
+
+    if len(df_valid) <= 1:
+        return out
+
+    rates = compute_evaporation_rate(
+        df_valid,
+        time_col="timestamp_s",
+        vol_col=vol_col,
+        out_col=out_col,
+    )
+
+    out.loc[rates.index] = rates
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +892,8 @@ def main() -> int:
             frame,
             px_to_mm=px_to_mm,
             clip_limit=args.clip_limit,
+            control_body_start_y_global=args.control_body_start_y,
+            sample_body_start_y_global=args.sample_body_start_y,
         )
 
         # Accumulate bodyellipse audit (always, even when detection fails)
@@ -546,42 +902,70 @@ def main() -> int:
             _ad["frame_id"] = frame_num
             _audit_records.append(_ad)
 
-        if dual["control"] is None or dual["sample"] is None:
-            logger.debug("Frame %d: dual detection failed.", frame_num)
+        # FIX 5: persistencia independiente por lado.
+        #
+        # Una detección ausente ya NO elimina la detección válida de la
+        # gota contralateral. ``processed`` conserva su semántica histórica:
+        # número de frames donde AMBAS gotas fueron detectadas.
+        ctrl_det = dual["control"]
+        samp_det = dual["sample"]
+
+        both_detected = ctrl_det is not None and samp_det is not None
+
+        if both_detected:
+            processed += 1
+        else:
             failed += 1
-            continue
-
-        ctrl_det: BubbleDetection = dual["control"]
-        samp_det: BubbleDetection = dual["sample"]
-
-        # QC físico independiente para cada gota
-        validate_detection_physics(ctrl_det, max_eccentricity=args.max_eccentricity)
-        validate_detection_physics(samp_det, max_eccentricity=args.max_eccentricity)
-
-        # Calidad geométrica del ajuste bodyellipse (independiente del QC físico)
-        apply_geometry_quality_gate(ctrl_det)
-        apply_geometry_quality_gate(samp_det)
-
-        # Construir fila pareada con columnas prefijadas
-        row: dict = {
-            "frame_id": frame_num,
-            "timestamp_s": round(timestamp_s, 4),
-            **_prefixed_dict(ctrl_det, "control"),
-            **_prefixed_dict(samp_det, "sample"),
-        }
-        results.append(row)
-        processed += 1
-
-        if processed % 100 == 0:
-            logger.info(
-                "  Processed %d frames (frame #%d, t=%.1fs)...",
-                processed, frame_num, timestamp_s,
+            logger.debug(
+                "Frame %d: one or both drop detections missing.",
+                frame_num,
             )
 
-        # Visualización por fotograma (ambas gotas anotadas)
-        if args.visualize:
+        # QC físico y geométrico estrictamente independientes.
+        if ctrl_det is not None:
+            validate_detection_physics(
+                ctrl_det,
+                max_eccentricity=args.max_eccentricity,
+            )
+            apply_geometry_quality_gate(ctrl_det)
+
+        if samp_det is not None:
+            validate_detection_physics(
+                samp_det,
+                max_eccentricity=args.max_eccentricity,
+            )
+            apply_geometry_quality_gate(samp_det)
+
+        # Siempre conservar el timestamp intentado.
+        # Las medidas del lado ausente quedarán como NaN al construir
+        # posteriormente el DataFrame.
+        row = _build_independent_frame_row(
+            frame_num=frame_num,
+            timestamp_s=timestamp_s,
+            ctrl_det=ctrl_det,
+            samp_det=samp_det,
+        )
+        results.append(row)
+
+        attempted = processed + failed
+        if attempted % 100 == 0:
+            logger.info(
+                "  Attempted %d frames (frame #%d, t=%.1fs)...",
+                attempted,
+                frame_num,
+                timestamp_s,
+            )
+
+        # La visualización histórica requiere ambas detecciones.
+        # No inventar una elipse para el lado ausente.
+        if args.visualize and both_detected:
             vis_path = Path(args.vis_dir) / f"frame_{frame_num:06d}.png"
-            save_annotated_frame_dual(frame, ctrl_det, samp_det, vis_path)
+            save_annotated_frame_dual(
+                frame,
+                ctrl_det,
+                samp_det,
+                vis_path,
+            )
 
     # ── Diagnóstico bodyellipse ──────────────────────────────────────
     _print_bodyellipse_audit(_audit_records)
@@ -594,28 +978,55 @@ def main() -> int:
     # ── Paso 5: Construir DataFrame ───────────────────────────────────────
     df = pd.DataFrame(results)
 
+    # ── Paso 5b: DUAL-QC temporal (metadata/diagnóstico exclusivamente) ───
+    # Opera sobre radius_eq_mm ya producido por el selector BODY (Fix 2).
+    # NO modifica tracking_valid, geometry_quality_valid ni ninguna máscara
+    # analítica (binning, R² fit, dV/dt, K).
+    df = add_temporal_qc(df)
+
     # ── Calidad del ajuste bodyellipse ────────────────────────────────────
     _print_fit_quality_audit(df)
 
     # ── DETECTION QUALITY SUMMARY ─────────────────────────────────────────
+    # FIX 5: contabilidad estrictamente independiente por gota.
     logger.info("=" * 64)
     logger.info("DETECTION QUALITY SUMMARY")
     logger.info("  RMSE threshold: %.4f", BODYELLIPSE_MAX_RESIDUAL_RMSE)
+
     for _lbl in LABELS:
-        _gqv_col  = f"{_lbl}_geometry_quality_valid"
-        _n_det    = processed           # both drops detected (same for both sides)
+        _counts = _side_frame_counts(df, _lbl)
+        _gqv_col = f"{_lbl}_geometry_quality_valid"
+
         if _gqv_col in df.columns:
-            _n_geom_ok  = int((df[_gqv_col] == True).sum())
+            _n_geom_ok = int((df[_gqv_col] == True).sum())
             _n_geom_rej = int((df[_gqv_col] == False).sum())
         else:
-            _n_geom_ok  = _n_det
+            _n_geom_ok = 0
             _n_geom_rej = 0
-        _pct_rej = 100.0 * _n_geom_rej / _n_det if _n_det > 0 else 0.0
-        logger.info(
-            "  %s: detections=%d  geometry_valid=%d  "
-            "geometry_rejected=%d  rejected_pct=%.1f%%",
-            _lbl.upper(), _n_det, _n_geom_ok, _n_geom_rej, _pct_rej,
+
+        _n_det = _counts["detected_frames"]
+        _pct_geom_rej = (
+            100.0 * _n_geom_rej / _n_det
+            if _n_det > 0 else 0.0
         )
+
+        logger.info(
+            "  %s: attempted=%d  detections=%d  missing=%d  "
+            "geometry_valid=%d  geometry_rejected=%d  "
+            "geometry_rejected_pct=%.1f%%  analytical_valid=%d  "
+            "qc_rejected=%d  unusable=%d",
+            _lbl.upper(),
+            _counts["total_frames"],
+            _counts["detected_frames"],
+            _counts["missing_frames"],
+            _n_geom_ok,
+            _n_geom_rej,
+            _pct_geom_rej,
+            _counts["valid_frames"],
+            _counts["qc_rejected_frames"],
+            _counts["unusable_frames"],
+        )
+
     logger.info("=" * 64)
 
     # ── Paso 6: Suavizado temporal ────────────────────────────────────────
@@ -635,30 +1046,12 @@ def main() -> int:
                     df[col] = temporal_smooth(df[col], args.smooth)
 
     # ── Paso 7: Tasas de evaporación independientes (dV/dt) ───────────────
+    # FIX 7: usar la misma máscara analítica central que binning y fits.
+    # geometry_quality_valid se conserva como diagnóstico y no actúa aquí
+    # como censor independiente.
     for lbl in LABELS:
-        vol_col = f"{lbl}_volume_mm3"
-        valid_col = f"{lbl}_tracking_valid"
         out_col = f"{lbl}_evap_rate_mm3_s"
-
-        if vol_col in df.columns and df[vol_col].notna().any():
-            # Filtrar por tracking_valid Y geometry_quality_valid
-            _geom_col = f"{lbl}_geometry_quality_valid"
-            _evap_mask = df[valid_col] == True
-            if _geom_col in df.columns:
-                _evap_mask &= (df[_geom_col] == True)
-            df_valid = df[_evap_mask].copy()
-            if len(df_valid) > 1:
-                rates = compute_evaporation_rate(
-                    df_valid,
-                    time_col="timestamp_s",
-                    vol_col=vol_col,
-                    out_col=out_col,
-                )
-                df[out_col] = rates.reindex(df.index)
-            else:
-                df[out_col] = None
-        else:
-            df[out_col] = None
+        df[out_col] = _compute_side_evaporation_rate(df, lbl)
 
     # ── Paso 8: Exportar CSV pareado ──────────────────────────────────────
     df.to_csv(args.output, index=False)
@@ -678,13 +1071,10 @@ def main() -> int:
     if args.bin_size_s is not None and args.bin_size_s > 0.0:
         logger.info("Performing binned analysis (bin=%.2fs)...", args.bin_size_s)
 
-        # Usar solo filas donde AMBAS gotas son válidas (tracking Y calidad geométrica)
-        both_valid = (
-            (df.get("control_tracking_valid", True) == True)
-            & (df.get("sample_tracking_valid", True) == True)
-            & (df.get("control_geometry_quality_valid", True) == True)
-            & (df.get("sample_geometry_quality_valid", True) == True)
-        )
+        # FIX 7: la validez pareada es exclusivamente la intersección
+        # de las validades analíticas individuales. El RMSE bodyellipse
+        # permanece como diagnóstico y no introduce un veto adicional.
+        both_valid = _paired_valid_mask(df)
         df_qc = df[both_valid].copy()
 
         if not df_qc.empty:
@@ -710,9 +1100,15 @@ def main() -> int:
                             s = group[col].std(ddof=1) if n > 1 else 0.0
                             row_b[f"{col}_mean"] = round(m, 4)
                             row_b[f"{col}_sd"] = round(float(s) if not pd.isna(s) else 0.0, 4)
+                            # FIX 4: mediana de radius_eq_mm2 para Theil–Sen
+                            # Almacenada con 4 decimales, que es el valor que entra al fit.
+                            if base == "radius_eq_mm2":
+                                row_b[f"{col}_median"] = round(group[col].median(), 4)
                         else:
                             row_b[f"{col}_mean"] = None
                             row_b[f"{col}_sd"] = 0.0
+                            if base == "radius_eq_mm2":
+                                row_b[f"{col}_median"] = None
                 binned_rows.append(row_b)
 
             binned_df = pd.DataFrame(binned_rows)
@@ -728,23 +1124,19 @@ def main() -> int:
     if args.r2_fit:
         logger.info("Performing independent linear fit (r²_eq vs time) per drop...")
 
-        total_frames = processed + failed
+        total_frames = len(df)
         summary_rows: list[dict] = []
 
         for lbl in LABELS:
-            valid_col   = f"{lbl}_tracking_valid"
-            geom_col    = f"{lbl}_geometry_quality_valid"
-            r2_col      = f"{lbl}_radius_eq_mm2"
+            r2_col = f"{lbl}_radius_eq_mm2"
 
-            # Filtrar por tracking_valid Y geometry_quality_valid
-            mask_valid = pd.Series([True] * len(df), index=df.index)
-            if valid_col in df.columns:
-                mask_valid &= (df[valid_col] == True)
-            if geom_col in df.columns:
-                mask_valid &= (df[geom_col] == True)
+            # FIX 5: validez y contabilidad independientes por gota.
+            counts = _side_frame_counts(df, lbl)
+            mask_valid = _side_valid_mask(df, lbl)
             df_lbl = df[mask_valid]
-            valid_frames = len(df_lbl)
-            rejected = failed + int((~mask_valid).sum())
+
+            valid_frames = counts["valid_frames"]
+            rejected = counts["unusable_frames"]
 
             slope = intercept = r_sq = fit_start = fit_end = None
             b_slope = b_intercept = b_rsq = n_bins = None
@@ -772,36 +1164,130 @@ def main() -> int:
                 else:
                     logger.warning("[%s] Fewer than 2 valid frames — cannot fit.", lbl)
 
-            # Ajuste binned por gota
-            if binned_df is not None and not binned_df.empty:
+            # FIX 5: binning analítico independiente por gota.
+            #
+            # results_dual_binned.csv permanece como producto PAREADO para
+            # comparación simultánea. Los fits individuales, en cambio,
+            # deben usar exclusivamente los puntos válidos de cada lado.
+            side_binned_df = None
+
+            if args.bin_size_s is not None and args.bin_size_s > 0.0:
+                side_binned_df = _bin_side_independently(
+                    df,
+                    side=lbl,
+                    bin_size_s=args.bin_size_s,
+                )
+
+            # Ajuste binned OLS por gota.
+            if side_binned_df is not None and not side_binned_df.empty:
                 b_r2_col = f"{lbl}_radius_eq_mm2_mean"
-                df_bfit = binned_df[binned_df[b_r2_col].notna()] if b_r2_col in binned_df.columns else pd.DataFrame()
-                n_bins = len(binned_df)
+
+                if b_r2_col in side_binned_df.columns:
+                    df_bfit = side_binned_df[
+                        side_binned_df[b_r2_col].notna()
+                    ]
+                else:
+                    df_bfit = pd.DataFrame()
+
+                n_bins = len(side_binned_df)
+
                 if px_to_mm is not None and len(df_bfit) >= 2:
                     xb = df_bfit["time_mean_s"].values
                     yb = df_bfit[b_r2_col].values
-                    b_slope, b_intercept, b_rsq = _linear_fit(xb, yb)
-                    logger.info(
-                        "  [%s binned] slope=%.6f  intercept=%.6f  R²=%.4f",
-                        lbl, b_slope, b_intercept, b_rsq,
+
+                    b_slope, b_intercept, b_rsq = _linear_fit(
+                        xb,
+                        yb,
                     )
+
+                    logger.info(
+                        "  [%s binned-independent] "
+                        "slope=%.6f  intercept=%.6f  R²=%.4f  bins=%d",
+                        lbl,
+                        b_slope,
+                        b_intercept,
+                        b_rsq,
+                        n_bins,
+                    )
+
+            # FIX 4 + FIX 5:
+            # Theil–Sen conserva exactamente su algoritmo congelado,
+            # pero recibe ahora los bins independientes de esta gota.
+            #
+            # La mediana radius_eq_mm2 ya está redondeada a 4 decimales
+            # por _bin_side_independently().
+            # NO usa DUAL-QC y no impone mínimo nuevo de puntos por bin.
+            rob_slope = rob_intercept = rob_rsq = rob_K = rob_n = None
+
+            if side_binned_df is not None and not side_binned_df.empty:
+                rob_col = f"{lbl}_radius_eq_mm2_median"
+
+                if rob_col in side_binned_df.columns and px_to_mm is not None:
+                    df_rob = side_binned_df[
+                        ["time_mean_s", rob_col]
+                    ].copy()
+
+                    df_rob = df_rob[
+                        df_rob[rob_col].notna()
+                    ]
+
+                    if len(df_rob) >= 2:
+                        xr = df_rob["time_mean_s"].values.astype(float)
+                        yr = df_rob[rob_col].values.astype(float)
+
+                        ts_result = _theil_sen_fit(xr, yr)
+
+                        if ts_result is not None:
+                            rob_slope = ts_result["slope"]
+                            rob_intercept = ts_result["intercept"]
+                            rob_rsq = ts_result["r_squared"]
+                            rob_K = ts_result["K"]
+                            rob_n = ts_result["n_pairwise_slopes"]
+
+                            logger.info(
+                                "  [%s robust-TS-independent] "
+                                "K=%.9f  intercept=%.9f  "
+                                "R²=%.9f  n_slopes=%d  bins=%d",
+                                lbl,
+                                rob_K,
+                                rob_intercept,
+                                rob_rsq,
+                                rob_n,
+                                len(side_binned_df),
+                            )
 
             summary_rows.append({
                 "drop": lbl,
                 "input_video": video_path.name,
                 "total_frames": total_frames,
+                "detected_frames": counts["detected_frames"],
+                "missing_frames": counts["missing_frames"],
                 "valid_frames": valid_frames,
+                "qc_rejected_frames": counts["qc_rejected_frames"],
+                "unusable_frames": counts["unusable_frames"],
+                # Campo histórico: conservar por compatibilidad.
+                # Bajo FIX 5 equivale a total_frames - valid_frames.
                 "rejected_frames": rejected,
                 "fit_start_s": round(fit_start, 4) if fit_start is not None else None,
                 "fit_end_s": round(fit_end, 4) if fit_end is not None else None,
+                # --- columnas históricas OLS raw (conservar intactas) ---
                 "slope_radius2_mm2_s": round(slope, 6) if slope is not None else None,
                 "intercept_radius2_mm2": round(intercept, 6) if intercept is not None else None,
                 "r_squared_fit": round(r_sq, 4) if r_sq is not None else None,
+                # --- columnas históricas OLS binned (conservar intactas) ---
                 "binned_slope_radius2_mm2_s": round(b_slope, 6) if b_slope is not None else None,
                 "binned_intercept_radius2_mm2": round(b_intercept, 6) if b_intercept is not None else None,
                 "binned_r_squared": round(b_rsq, 4) if b_rsq is not None else None,
                 "bin_size_s": args.bin_size_s,
                 "n_bins": n_bins,
+                # --- FIX 4: campos robustos Theil–Sen (nuevos, inequívocos) ---
+                "robust_binned_slope_radius2_mm2_s":   rob_slope,
+                "robust_binned_intercept_radius2_mm2": rob_intercept,
+                "robust_binned_r_squared":             rob_rsq,
+                "robust_binned_K_mm2_s":               rob_K,
+                "robust_binned_n_pairwise_slopes":     rob_n,
+                "robust_binned_statistic":             "median",
+                "robust_binned_fit_method":            "theil_sen_joint",
             })
 
         pd.DataFrame(summary_rows).to_csv(args.summary_output, index=False)

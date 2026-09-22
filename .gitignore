@@ -112,3 +112,6 @@ Plan_de_desarrollo_Dual.md
 # ---------------------------------------------------------------------------
 *.tif
 *.tiff
+
+# Resultados del Guided Runner
+results/

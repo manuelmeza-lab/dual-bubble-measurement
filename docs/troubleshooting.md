@@ -1,262 +1,743 @@
-# Solución de Problemas
+# Solución de problemas — BubbleCV Dual
 
-Esta guía cubre los errores y situaciones problemáticas más comunes al
-usar BubbleCV Dual.
+Esta guía cubre problemas frecuentes de instalación, video, detección y
+control de calidad.
 
-**Primera herramienta de diagnóstico:** los frames anotados generados con
-`--visualize`. Revisar esas imágenes antes de modificar cualquier parámetro.
+Para una primera corrida consulta:
 
----
+→ [`quickstart.md`](./quickstart.md)
 
-## Errores de instalación
+Para la semántica científica completa:
 
-### "No module named 'cv2'"
-
-OpenCV no está instalado o el entorno virtual no está activo.
-
-```bash
-# 1. Verificar que el entorno virtual esté activo (debe verse "(venv)" en el prompt)
-source venv/bin/activate        # macOS/Linux
-venv\Scripts\Activate.ps1       # Windows PowerShell
-
-# 2. Instalar dependencias
-pip install -r requirements.txt
-
-# 3. Verificar
-python -c "import cv2; print(cv2.__version__)"
-```
-
-### "No module named 'pandas'" / "No module named 'matplotlib'"
-
-Mismo problema. Ejecuta `pip install -r requirements.txt` con el entorno activo.
+→ [`analysis_guide.md`](./analysis_guide.md)
 
 ---
 
-## Errores al leer archivos
+## 1. Antes de modificar parámetros
 
-### "Failed to load image"
+Si una corrida produce un resultado extraño, no cambies inmediatamente
+`clip-limit`, excentricidad, BODY, FPS o suavizado.
 
-- Verifica que la ruta sea correcta (sin errores de tipeo).
-- Verifica que el formato sea soportado: `.png`, `.jpg`, `.bmp`, `.tiff`.
-- Si la ruta tiene espacios, enciérrala en comillas:
-  ```bash
-  python analyze_image.py --input "path/to/mi imagen.png" --calibration XX.XX
-  ```
+Primero revisa:
 
-### "Failed to open video" / `cap.isOpened()` devuelve `False`
+1. video de entrada;
+2. FPS;
+3. calibración;
+4. posición CONTROL/SAMPLE;
+5. BODY utilizado;
+6. resumen de detección;
+7. `results.csv`;
+8. `summary.csv`;
+9. gráficas;
+10. QC geométrico y contour consensus.
 
-El video tiene un formato o codec no soportado por OpenCV.
-
-```bash
-python - <<'EOF'
-import cv2
-cap = cv2.VideoCapture("path/to/video.mp4")
-print("Abierto:", cap.isOpened())
-cap.release()
-EOF
-```
-
-**Solución:**
-
-Convierte a MP4 H.264 con ffmpeg:
-```bash
-ffmpeg -i path/to/input.mov -c:v libx264 -crf 18 path/to/output.mp4
-```
-
-Consulta → [`docs/video_conversion.md`](./video_conversion.md)
+Los parámetros no deben modificarse buscando mejorar K o R².
 
 ---
 
-## Problemas de detección dual
+## 2. El entorno virtual no está activo
 
-### "dual detection failed" en muchos frames
+Síntomas frecuentes:
 
-El detector no encontró una o ambas gotas en esos frames.
+`No module named 'cv2'`
 
-**Diagnóstico — primero:**
-```bash
-python analyze_video.py \
-    --input VIDEO.mp4 \
-    --calibration XX.XX \
-    --fps FPS_REAL \
-    --skip N \
-    --visualize \
-    --vis-dir RESULTS/debug \
-    --verbose
-```
+`No module named 'pandas'`
 
-Revisa los frames en `RESULTS/debug/` para ver dónde y por qué falla.
-Causas comunes:
+`No module named 'matplotlib'`
 
-| Causa | Señal |
-|-------|-------|
-| Gota fuera del ROI definido | Elipse en posición incorrecta o ausente |
-| Gota muy pequeña / muy grande | Sin detección Hough |
-| Imagen de bajo contraste | Segmentación incorrecta visible en frame anotado |
-| Capilar visible dentro del contorno | Cuerpo libre no aislado correctamente |
+### macOS / Linux
 
-### geometry_quality_valid = False en muchos frames
+Activa:
 
-El ajuste bodyellipse produce `residual_rmse > 0.08`.
+`source venv/bin/activate`
 
-**Diagnóstico:**
+### Windows PowerShell
 
-1. Revisa los frames anotados. ¿La elipse verde sigue el borde externo de la
-   gota o se inclina / sobredimensiona?
-2. ¿La línea amarilla (body_start) aparece dentro del capilar en lugar de en
-   la transición cuello-cuerpo?
-3. ¿Hay reflejos internos brillantes que el detector confunde con el borde?
-4. ¿La gota vibra físicamente o está fuera de foco?
+Activa:
 
-**Acciones según causa:**
+`venv\Scripts\Activate.ps1`
 
-| Causa probable | Acción |
-|----------------|--------|
-| Frames del inicio/fin del experimento (gota inestable) | Recortar la ventana temporal |
-| Vibración física | Investigar la causa experimental; no es corregible en el software |
-| Reflejos internos dominando la segmentación | Revisar condiciones de iluminación |
-| body_start dentro del capilar | El pipeline detecta la transición; si falla sistemáticamente, revisar si la gota tiene forma inusual |
+Después comprueba:
 
-**Lo que NO debes hacer:** cambiar `BODYELLIPSE_MAX_RESIDUAL_RMSE = 0.08`
-para "reducir" el rechazo. Ese umbral refleja calidad geométrica real.
-
-### residual_rmse > 0.08 en frames aislados (no agrupados)
-
-Es esperable en algunos frames por perturbaciones momentáneas. El filtro
-los excluye automáticamente. Revisa que no estén agrupados temporalmente.
-
-### La elipse no sigue el borde externo de la gota
-
-- Revisa en los frames anotados si el contorno magenta (puntos enviados a
-  fitEllipse) incluye el capilar superior.
-- Revisa si la línea body_start (amarilla) está demasiado alta.
-- No aumentes `--clip-limit` arbitrariamente para "arreglar" esto; puede
-  introducir artefactos en otros frames.
-
-### El contorno incluye reflejos internos
-
-Los reflejos especulares internos a la gota pueden hacer que la segmentación
-incluya esa región como parte del objeto. Esto produce contornos irregulares
-y residuos altos. Diagnóstico: ver el contorno magenta en los frames anotados.
-
-### Bodyellipse no produce resultado (body_contour_lt_5_points)
-
-El contorno físico del cuerpo libre tiene menos de 5 puntos después de filtrar
-por body_start_y. Causa probable: la gota es muy pequeña en esa región o la
-segmentación la fragmenta. No se inventa ningún punto; el frame se descarta.
+`python -m pip check`
 
 ---
 
-## Problemas de calibración
+## 3. Dependencias faltantes
 
-### Columnas `_mm` vacías o NaN en el CSV
+### macOS de referencia
 
-No se proporcionó calibración. Añade `--calibration XX.XX` con el valor
-medido para tu configuración óptica.
+Si estás reproduciendo el entorno validado:
 
-### La calibración automática detecta el objeto incorrecto
+`python -m pip install -r requirements-lock.txt`
 
-- Verifica que la imagen tenga un único objeto circular bien visible.
-- Ajusta `--min-radius` / `--max-radius` para restringir la búsqueda al
-  tamaño del objeto de referencia en píxeles.
-- Usa `--verbose` para ver qué detectó el sistema.
-- Si no converge, usa calibración manual (ver `docs/calibration.md`).
+### Instalación general
 
-### El FPS es incorrecto
+`python -m pip install -r requirements.txt`
 
-Si `--fps` no corresponde a la cadencia del archivo analizado, el eje de
-tiempo del CSV será incorrecto y K quedará escalado incorrectamente.
-Inspecciona los metadatos con ffprobe:
+Después:
 
-```bash
-ffprobe -v error -select_streams v:0 \
-  -show_entries stream=r_frame_rate,avg_frame_rate \
-  -of default=noprint_wrappers=1:nokey=1 VIDEO.mp4
-```
+`python -m pip check`
+
+Una instalación sin conflictos debe mostrar:
+
+`No broken requirements found.`
 
 ---
 
-## Problemas de calidad de resultados
+## 4. El video no existe
 
-### R² bajo en el ajuste lineal
+El Guided Runner muestra:
 
-No es directamente un problema del software. Causas posibles:
+`ERROR: no existe el archivo`
 
-- La gota no está en régimen estacionario de evaporación (ventana temporal
-  mal elegida: inicio o fin de experimento).
-- Perturbaciones externas durante el experimento.
-- Frames rechazados por QC agrupados temporalmente (revisar distribución
-  de `geometry_quality_valid = False` en el CSV).
-- Mezcla de regímenes de evaporación distintos.
+Comprueba la ruta introducida.
 
-**No** se debe ajustar parámetros del software para "mejorar" el R².
-
-### Saltos o escalones en la serie temporal
-
-- Revisa los frames anotados en la región del salto.
-- Puede ser un cambio real en la gota (perturbación física, vibración, contacto).
-- Puede ser un frame con detección errónea que pasó el QC.
-
-### Tendencia no lineal visible
-
-El modelo r_eq²(t) = r0² − K·t es lineal. Si la tendencia observada no es
-lineal, el régimen de evaporación puede ser diferente o la ventana temporal
-incluye fases distintas.
+En macOS puedes arrastrar un archivo desde Finder hacia Terminal para obtener
+su ruta completa.
 
 ---
 
-## Problemas específicos de macOS
+## 5. El video no puede abrirse
 
-### Error de permisos al acceder a la carpeta de videos
+Puede existir un problema de codec o contenedor.
 
-Ve a **Ajustes del Sistema → Privacidad y Seguridad → Acceso total al disco**
-y añade Terminal.
+Se recomienda:
 
-### El proceso se interrumpe por suspensión del sistema
+- MP4;
+- H.264;
+- CFR cuando el protocolo requiera cadencia constante.
 
-```bash
-caffeinate -i python analyze_video.py --input VIDEO.mp4 ...
-```
+Consulta:
 
-Consulta → [`docs/prevent_sleep.md`](./prevent_sleep.md)
-
-### Error "Operation not permitted" en macOS Sonoma
-
-Puede ocurrir con archivos descargados de internet:
-```bash
-xattr -rd com.apple.quarantine /ruta/a/tu/carpeta/
-```
+→ [`video_conversion.md`](./video_conversion.md)
 
 ---
 
-## Problemas específicos de Windows
+## 6. BubbleCV no muestra metadatos del video
 
-### PowerShell no puede ejecutar el script de activación del venv
+El Guided Runner utiliza `ffprobe` cuando está disponible.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
+Comprueba:
 
-### Rutas con espacios
+`ffprobe -version`
 
-```powershell
-# Incorrecto
-python analyze_video.py --input Mi Carpeta\video.mp4
+En macOS puede instalarse mediante:
 
-# Correcto
-python analyze_video.py --input "Mi Carpeta\video.mp4"
-```
+`brew install ffmpeg`
 
-### El video `.mov` no se abre en Windows
-
-Convierte con ffmpeg:
-```bash
-ffmpeg -i video.mov -c:v libx264 -crf 18 video.mp4
-```
+Si `ffprobe` no está disponible, el Guided Runner puede seguir funcionando,
+pero no mostrará automáticamente codec, resolución, FPS y duración.
 
 ---
 
-## Recursos adicionales
+## 7. FPS incorrecto
 
-- Documentación de OpenCV: [docs.opencv.org](https://docs.opencv.org)
-- Manual operativo: [`docs/analysis_guide.md`](./analysis_guide.md)
+BubbleCV calcula:
+
+`timestamp_s = frame_num / fps`
+
+Por ello, un FPS incorrecto escala directamente el eje temporal y las
+pendientes.
+
+No cambies el FPS para intentar obtener una K esperada.
+
+Comprueba el archivo con:
+
+`ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate,avg_frame_rate,duration -of default=noprint_wrappers=1 VIDEO.mp4`
+
+Si el archivo es VFR y el protocolo requiere tiempo uniforme, conviértelo a
+CFR antes del análisis.
+
+---
+
+## 8. Calibración incorrecta
+
+La calibración está expresada en:
+
+`px/mm`
+
+Debe corresponder a la configuración óptica del video analizado.
+
+Si cambió:
+
+- zoom;
+- resolución;
+- óptica;
+- distancia de trabajo;
+- posición de cámara;
+
+la calibración debe revisarse.
+
+Consulta:
+
+→ [`calibration.md`](./calibration.md)
+
+---
+
+## 9. Fallos de detección en frames aislados
+
+Puede aparecer un mensaje como:
+
+`ROI [control]: detection failed`
+
+o:
+
+`ROI [sample]: detection failed`
+
+Eso significa que en ese frame concreto no sobrevivió una detección válida
+para ese lado.
+
+No significa automáticamente que toda la corrida haya fallado.
+
+BubbleCV conserva la información de cada gota independientemente.
+
+Por ejemplo:
+
+- SAMPLE puede faltar;
+- CONTROL puede seguir siendo analíticamente válido.
+
+Y viceversa.
+
+Revisa al final:
+
+- `detections`;
+- `missing`;
+- `analytical_valid`;
+- `qc_rejected`;
+- `unusable`.
+
+---
+
+## 10. Muchas detecciones ausentes
+
+Si `missing` es elevado, revisa:
+
+- posición de la gota dentro de la ROI;
+- tamaño aparente;
+- foco;
+- contraste;
+- vibración;
+- iluminación;
+- desaparición física de la gota al final del experimento.
+
+No aumentes arbitrariamente parámetros del detector para forzar detecciones.
+
+---
+
+## 11. BODY automático parece incorrecto
+
+Con BODY automático, BubbleCV estima la transición cuello → cuerpo libre.
+
+Revisa las variables:
+
+- `body_start_y_global`;
+- `body_start_y_local`;
+- `body_max_width`.
+
+Si necesitas una auditoría visual avanzada puedes ejecutar directamente
+`analyze_video.py` con `--visualize`.
+
+Ejemplo conceptual:
+
+`python analyze_video.py --input VIDEO.mp4 --calibration PX_PER_MM --fps FPS --skip N --r2-fit --bin-size-s 10 --visualize --vis-dir DEBUG_FRAMES`
+
+No fijes BODY únicamente porque otra coordenada produzca mejor R².
+
+---
+
+## 12. BODY fijo produce un error
+
+Una coordenada BODY fija:
+
+- debe ser un entero;
+- representa Y global del frame;
+- debe caer dentro del intervalo vertical de la ROI.
+
+BubbleCV no corrige silenciosamente una frontera fuera de rango.
+
+Ejemplo:
+
+`--sample-body-start-y 56`
+
+Si aparece un error de frontera, revisa que la coordenada corresponda
+realmente al frame completo y no a un recorte local.
+
+---
+
+## 13. `geometry_quality_valid = False`
+
+Esta bandera describe la calidad geométrica del ajuste `bodyellipse`.
+
+El criterio diagnóstico actual utiliza:
+
+`bodyellipse_residual_rmse <= 0.08`
+
+Por ello:
+
+`geometry_quality_valid = False`
+
+indica que el ajuste presenta un residual RMSE superior al umbral o que el
+residual requerido no está disponible.
+
+### Importante
+
+En la versión actual:
+
+**`geometry_quality_valid = False` NO veta automáticamente la medición.**
+
+No implica por sí solo que el frame quede fuera de:
+
+- dV/dt;
+- ajuste OLS;
+- binning independiente;
+- ajuste Theil–Sen;
+- cálculo de K.
+
+El RMSE se conserva como diagnóstico geométrico.
+
+---
+
+## 14. RMSE > 0.08 en algunos frames
+
+No elimines automáticamente esos frames.
+
+Utiliza el RMSE para localizar regiones que merecen inspección.
+
+Revisa:
+
+- contorno físico;
+- forma de la gota;
+- final de evaporación;
+- vibración;
+- desenfoque;
+- reflejos;
+- cambios bruscos de geometría.
+
+Un grupo temporal de RMSE altos puede ser informativo aunque no actúe como
+veto analítico.
+
+---
+
+## 15. `geometry_rejected` es alto pero `analytical_valid` también es alto
+
+Esto puede ser completamente coherente con la semántica actual.
+
+`geometry_rejected` cuenta detecciones con:
+
+`geometry_quality_valid = False`
+
+mientras que `analytical_valid` utiliza la máscara analítica real.
+
+Por tanto, ambos números no representan la misma cosa.
+
+No interpretes:
+
+`geometry_rejected`
+
+como sinónimo de:
+
+`qc_rejected`
+
+---
+
+## 16. ¿Qué determina realmente la validez analítica?
+
+Para cada gota, una observación es analíticamente válida cuando:
+
+1. `tracking_valid == True`;
+2. `radius_eq_mm2` está disponible;
+3. y, si contour consensus es aplicable,
+   `contour_consensus_valid == True`.
+
+Conceptualmente:
+
+`tracking_valid AND radius_available AND consensus_pass_if_applicable`
+
+La validez de la otra gota no forma parte de esta decisión individual.
+
+---
+
+## 17. `tracking_valid = False`
+
+Puede ocurrir por:
+
+- excentricidad mayor al máximo permitido;
+- diámetro equivalente ausente o no positivo;
+- volumen ausente o no positivo.
+
+Consulta:
+
+`rejection_reason`
+
+para conocer la causa registrada.
+
+No incrementes `--max-eccentricity` después de observar el resultado para
+recuperar artificialmente frames rechazados.
+
+---
+
+## 18. Contour consensus
+
+Contour consensus es un QC diferente al RMSE de bodyellipse.
+
+Sus columnas incluyen:
+
+- `contour_consensus_applicable`;
+- `contour_consensus_valid`;
+- `contour_consensus_support_fraction`;
+- `contour_consensus_n_inliers`;
+- `contour_consensus_n_points`;
+- `contour_consensus_rejection_reason`.
+
+---
+
+## 19. `contour_consensus_applicable = False`
+
+Es esperado cuando el lado utiliza BODY automático.
+
+En ese caso contour consensus:
+
+- no es aplicable;
+- no veta la medición.
+
+No interpretes `contour_consensus_valid` aisladamente sin revisar primero
+`contour_consensus_applicable`.
+
+---
+
+## 20. `contour_consensus_applicable = True` y `valid = False`
+
+Esto ocurre con BODY fijo cuando el contorno físico no alcanza el consenso
+geométrico requerido.
+
+En ese caso sí existe un veto analítico para esa medición.
+
+La medición original:
+
+- no se borra;
+- permanece en `results.csv`;
+- puede auditarse posteriormente.
+
+Revisa:
+
+- `contour_consensus_support_fraction`;
+- `contour_consensus_n_inliers`;
+- `contour_consensus_n_points`;
+- `contour_consensus_rejection_reason`.
+
+No desactives este QC únicamente para recuperar una medición cuyo resultado
+parece conveniente.
+
+---
+
+## 21. `low_consensus`
+
+La razón:
+
+`low_consensus`
+
+indica que menos del soporte mínimo requerido pudo sostener una elipse
+geométricamente plausible bajo el procedimiento de consenso.
+
+El umbral científico congelado es:
+
+`support_fraction >= 0.50`
+
+con tolerancia radial de:
+
+`2 px`
+
+No modifiques esos valores buscando cambiar K.
+
+---
+
+## 22. `fewer_than_5_points`
+
+Contour consensus necesita al menos cinco puntos para ajustar una elipse.
+
+La razón:
+
+`fewer_than_5_points`
+
+significa que el contorno disponible no contiene suficientes puntos.
+
+Debe revisarse la detección y el video; no deben inventarse puntos.
+
+---
+
+## 23. `no_plausible_model`
+
+Significa que el procedimiento de consenso no encontró una elipse compatible
+con las restricciones geométricas del detector.
+
+Revisa:
+
+- segmentación;
+- BODY;
+- borde físico;
+- tamaño de la gota;
+- deformación real;
+- calidad óptica.
+
+---
+
+## 24. CONTROL y SAMPLE tienen diferente número de frames válidos
+
+Es posible y esperado.
+
+BubbleCV analiza cada lado independientemente.
+
+Una detección ausente o inválida en SAMPLE no elimina automáticamente una
+detección válida de CONTROL.
+
+Por eso `summary.csv` puede mostrar diferentes:
+
+- `detected_frames`;
+- `missing_frames`;
+- `valid_frames`;
+- `qc_rejected_frames`;
+- `unusable_frames`.
+
+---
+
+## 25. `binned.csv` tiene menos puntos de los esperados
+
+`binned.csv` es un producto **pareado**.
+
+Utiliza únicamente timestamps donde:
+
+- CONTROL es analíticamente válido;
+- SAMPLE es analíticamente válido.
+
+Por ello puede contener menos información que los ajustes independientes
+reportados en `summary.csv`.
+
+Esto no es una contradicción.
+
+---
+
+## 26. `n_bins` del summary no parece coincidir con el CSV pareado
+
+Los fits de `summary.csv` utilizan binning **independiente por gota**.
+
+El archivo `binned.csv`, en cambio, utiliza validez pareada.
+
+Por ello:
+
+- `binned.csv` sirve para comparación simultánea;
+- `n_bins` del summary corresponde al análisis independiente del lado.
+
+---
+
+## 27. Diferencia entre OLS y Theil–Sen
+
+BubbleCV conserva:
+
+- OLS frame a frame;
+- OLS binned;
+- Theil–Sen robusto binned.
+
+Una diferencia entre ellos no debe corregirse automáticamente.
+
+Puede indicar:
+
+- outliers;
+- cambio de régimen;
+- región final de evaporación;
+- perturbación experimental;
+- detecciones atípicas.
+
+Inspecciona la serie temporal antes de decidir si existe un problema.
+
+---
+
+## 28. R² bajo
+
+No existe un R² mínimo universal para todos los experimentos.
+
+Un R² bajo puede deberse a:
+
+- comportamiento no lineal;
+- cambio de régimen;
+- ruido experimental;
+- final de evaporación;
+- perturbación mecánica;
+- detección inestable.
+
+No modifiques parámetros del software únicamente para elevar R².
+
+---
+
+## 29. K negativa
+
+BubbleCV define exactamente:
+
+`K = -slope`
+
+No utiliza:
+
+`abs(slope)`
+
+Si `r_eq²` aumenta con el tiempo, la pendiente puede ser positiva y K
+resultará negativa.
+
+Eso requiere revisar la interpretación científica y la ventana temporal.
+
+No debe cambiarse automáticamente el signo.
+
+---
+
+## 30. Saltos en `r_eq²`
+
+Revisa el video alrededor del timestamp correspondiente.
+
+Posibles causas:
+
+- perturbación física;
+- movimiento;
+- cambio de iluminación;
+- proximidad al final de evaporación;
+- cambio de detección;
+- deformación real de la gota.
+
+Comprueba CONTROL y SAMPLE por separado.
+
+---
+
+## 31. La gota está casi evaporada
+
+Cerca de la desaparición de una gota pueden aumentar:
+
+- fallos de detección;
+- residuos geométricos;
+- cambios bruscos de forma;
+- sensibilidad a ruido.
+
+No debe asumirse que esa región pertenece al mismo régimen físico que el resto
+de la corrida.
+
+La elección de una ventana experimental debe justificarse por el protocolo,
+no por el deseo de obtener una pendiente determinada.
+
+---
+
+## 32. `run_manifest.json` falta
+
+El manifest sólo se genera cuando se utiliza:
+
+`python run_bubblecv.py`
+
+Una ejecución directa de:
+
+`analyze_video.py`
+
+no crea este archivo automáticamente.
+
+---
+
+## 33. La carpeta de resultados ya existe
+
+El Guided Runner devuelve un error para evitar sobrescrituras accidentales.
+
+Elige una carpeta nueva.
+
+Por defecto se propone un nombre con:
+
+- nombre del video;
+- fecha;
+- hora.
+
+---
+
+## 34. El SHA-256 tarda algunos segundos
+
+Antes de ejecutar el análisis, el Guided Runner calcula la huella SHA-256 del
+video.
+
+En archivos grandes esto puede tardar un poco.
+
+Es normal.
+
+La huella permite verificar posteriormente que dos corridas utilizaron
+exactamente los mismos bytes de entrada.
+
+---
+
+## 35. El análisis terminó con `exit_code` distinto de 0
+
+Consulta:
+
+- mensajes inmediatamente anteriores;
+- existencia del video;
+- permisos;
+- calibración;
+- parámetros BODY;
+- disponibilidad de dependencias.
+
+El `run_manifest.json` conserva el código de salida final cuando la carpeta de
+resultados ya fue creada.
+
+---
+
+## 36. macOS: acceso a archivos
+
+Si Terminal no puede acceder a una carpeta, revisa:
+
+**Ajustes del Sistema → Privacidad y Seguridad**
+
+y concede el permiso correspondiente cuando macOS lo solicite.
+
+No es necesario conceder acceso total al disco de forma preventiva.
+
+---
+
+## 37. macOS: suspensión durante análisis largos
+
+Consulta:
+
+→ [`prevent_sleep.md`](./prevent_sleep.md)
+
+---
+
+## 38. Windows: PowerShell bloquea el entorno virtual
+
+Puedes usar Command Prompt y activar mediante:
+
+`venv\Scripts\activate.bat`
+
+Consulta:
+
+→ [`windows.md`](./windows.md)
+
+---
+
+## 39. Antes de repetir una corrida
+
+Si vas a cambiar algún parámetro, registra primero:
+
+- qué parámetro cambiarás;
+- por qué;
+- qué evidencia experimental justifica el cambio.
+
+No hagas una serie de ajustes iterativos buscando la K o el R² que esperabas.
+
+---
+
+## 40. Recursos
+
+Guía rápida:
+
+→ [`quickstart.md`](./quickstart.md)
+
+Manual de análisis:
+
+→ [`analysis_guide.md`](./analysis_guide.md)
+
+Calibración:
+
+→ [`calibration.md`](./calibration.md)
+
+Conversión de video:
+
+→ [`video_conversion.md`](./video_conversion.md)

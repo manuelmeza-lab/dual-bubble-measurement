@@ -52,6 +52,22 @@ logger = logging.getLogger(__name__)
 _CAPILLARY_KERNEL_SIZE: int = 7      # Side length of the elliptical SE
 _CAPILLARY_OPEN_ITERS: int = 2       # Number of erosion+dilation cycles
 
+# ---------------------------------------------------------------------------
+# Body-selector consensus constants (Fix 2 — frozen, not CLI-configurable)
+# ---------------------------------------------------------------------------
+#: Maximum radius gap (mm) for two candidates to be considered mutually
+#: consistent and contribute to each other's support count.
+BODY_CONSENSUS_RADIUS_EPS_MM: float = 0.010
+
+#: Minimum support a consensus candidate must have before a switch is
+#: considered.  A value of 2 means at least one other candidate agrees.
+BODY_CONSENSUS_MIN_SUPPORT: int = 2
+
+#: Minimum ratio rmse_top1 / rmse_consensus that triggers a switch.  The
+#: condition is *strictly* greater-than, so a ratio of exactly 2.0 is NOT
+#: a switch.
+BODY_RMSE_RATIO_THRESHOLD: float = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -116,6 +132,20 @@ class BubbleDetection:
     geometry_quality_valid:            bool = True
     geometry_quality_rejection_reason: str  = ""
 
+    # ---- Contour-consensus QC (Fix 8) ---------------------------------------
+    # Independent geometric QC of the physical contour selected by RC4.
+    #
+    # This flag NEVER replaces or modifies the measured ellipse/radius.
+    # Real detections overwrite these defaults immediately after construction.
+    # Defaults preserve backwards compatibility for manually constructed
+    # BubbleDetection objects used by historical tests/tools.
+    contour_consensus_applicable: bool = False
+    contour_consensus_valid: bool = True
+    contour_consensus_support_fraction: float | None = None
+    contour_consensus_n_inliers: int | None = None
+    contour_consensus_n_points: int | None = None
+    contour_consensus_rejection_reason: str = ""
+
     def to_dict(self) -> dict:
         """Convert to a flat dictionary suitable for CSV export."""
         return {
@@ -155,6 +185,19 @@ class BubbleDetection:
             # ---- Geometry quality gate -------------------------------------
             "geometry_quality_valid":            self.geometry_quality_valid,
             "geometry_quality_rejection_reason": self.geometry_quality_rejection_reason,
+            # ---- Contour-consensus QC (Fix 8) ------------------------------
+            "contour_consensus_applicable": self.contour_consensus_applicable,
+            "contour_consensus_valid": self.contour_consensus_valid,
+            "contour_consensus_support_fraction": (
+                round(self.contour_consensus_support_fraction, 4)
+                if self.contour_consensus_support_fraction is not None
+                else None
+            ),
+            "contour_consensus_n_inliers": self.contour_consensus_n_inliers,
+            "contour_consensus_n_points": self.contour_consensus_n_points,
+            "contour_consensus_rejection_reason": (
+                self.contour_consensus_rejection_reason
+            ),
         }
 
 
@@ -234,9 +277,23 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
 
     (cx, cy), (axis1, axis2), angle = cv2.fitEllipse(contour)
 
-    # cv2.fitEllipse returns *full* axis lengths (diameters)
-    major_axis = max(axis1, axis2)
-    minor_axis = min(axis1, axis2)
+    # cv2.fitEllipse returns *full* axis lengths (diameters).
+    # Canonicalise so that major_axis >= minor_axis AND angle_deg always
+    # points along the major axis.
+    # When axis1 >= axis2 the returned angle already references axis1 (the
+    # major one); when axis1 < axis2 the major axis is axis2, which is
+    # perpendicular to the stored angle — so we rotate 90°.
+    if axis1 >= axis2:
+        major_axis = axis1
+        minor_axis = axis2
+        major_angle = angle
+    else:
+        major_axis = axis2
+        minor_axis = axis1
+        major_angle = angle + 90.0
+
+    major_angle %= 180.0          # keep in [0, 180)
+
     semi_major = major_axis / 2.0
     semi_minor = minor_axis / 2.0
 
@@ -245,12 +302,433 @@ def _fit_single_ellipse(contour: np.ndarray) -> dict | None:
         "center_y": cy,
         "major_axis": major_axis,
         "minor_axis": minor_axis,
-        "angle_deg": angle,
+        "angle_deg": major_angle,
         "semi_major": semi_major,
         "semi_minor": semi_minor,
         "eccentricity": eccentricity(semi_major, semi_minor),
         "equiv_diameter_px": equivalent_diameter(semi_major, semi_minor),
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Contour-consensus QC (Fix 8)
+# ---------------------------------------------------------------------------
+#
+# Independent post-detection geometry diagnostic.
+#
+# IMPORTANT:
+# * Does NOT replace the RC4 ellipse.
+# * Does NOT change radius_eq_mm2 or any physical measurement.
+# * Does NOT alter candidate selection.
+# * Uses only the physical contour already selected by RC4.
+#
+# Purpose:
+# Ask whether at least half of the selected contour points can support one
+# geometrically plausible ellipse within a 2 px radial tolerance.
+#
+# The constants below are intentionally frozen for this validation branch.
+# They come from the diagnostic protocol evaluated on V1/V2/V3 and are NOT
+# tuned against K or R².
+
+_CONTOUR_CONSENSUS_THRESHOLD_PX: float = 2.0
+_CONTOUR_CONSENSUS_MIN_FRACTION: float = 0.50
+_CONTOUR_CONSENSUS_MAX_ITERATIONS: int = 3000
+_CONTOUR_CONSENSUS_SEED: int = 20260916
+
+# High-confidence early exit.
+# This affects runtime only; the scientific/QC acceptance threshold remains
+# 0.50. Borderline cases continue through the full RANSAC search.
+_CONTOUR_CONSENSUS_EARLY_FRACTION: float = 0.80
+
+
+def _contour_consensus_residual_px(
+    points: np.ndarray,
+    props: dict,
+) -> np.ndarray:
+    """Approximate radial point-to-ellipse residual in pixels."""
+
+    pts = np.asarray(
+        points,
+        dtype=float,
+    ).reshape(-1, 2)
+
+    cx = props["center_x"]
+    cy = props["center_y"]
+
+    a = props["semi_major"]
+    b = props["semi_minor"]
+
+    if a <= 0.0 or b <= 0.0:
+        return np.full(
+            len(pts),
+            np.inf,
+            dtype=float,
+        )
+
+    theta = math.radians(
+        props["angle_deg"]
+    )
+
+    ct = math.cos(theta)
+    st = math.sin(theta)
+
+    dx = pts[:, 0] - cx
+    dy = pts[:, 1] - cy
+
+    x = dx * ct + dy * st
+    y = -dx * st + dy * ct
+
+    rho = np.sqrt(
+        x * x + y * y
+    )
+
+    phi = np.arctan2(
+        y,
+        x,
+    )
+
+    denom = np.sqrt(
+        (np.cos(phi) ** 2) / (a * a)
+        +
+        (np.sin(phi) ** 2) / (b * b)
+    )
+
+    radius_ellipse = (
+        1.0 / denom
+    )
+
+    return np.abs(
+        rho - radius_ellipse
+    )
+
+
+def _contour_consensus_props_plausible(
+    props: dict | None,
+) -> bool:
+    """Apply the same basic ellipse-size/shape domain used by RC4."""
+
+    if props is None:
+        return False
+
+    major = props["major_axis"]
+    minor = props["minor_axis"]
+
+    if not (
+        35.0 <= major <= 125.0
+    ):
+        return False
+
+    if not (
+        25.0 <= minor <= 100.0
+    ):
+        return False
+
+    if major <= 0.0:
+        return False
+
+    if minor / major < 0.65:
+        return False
+
+    return True
+
+
+def _contour_consensus_refine(
+    points: np.ndarray,
+    initial_inliers: np.ndarray,
+    threshold_px: float,
+) -> tuple[dict | None, np.ndarray]:
+    """Refine a RANSAC consensus using the same 3-step protocol as dry-run."""
+
+    pts = np.asarray(
+        points,
+        dtype=np.float32,
+    ).reshape(-1, 2)
+
+    inliers = np.asarray(
+        initial_inliers,
+        dtype=bool,
+    ).copy()
+
+    props = None
+
+    for _ in range(3):
+
+        if int(inliers.sum()) < 5:
+            break
+
+        consensus = (
+            pts[inliers]
+            .reshape(-1, 1, 2)
+            .astype(np.float32)
+        )
+
+        try:
+            candidate = _fit_single_ellipse(
+                consensus
+            )
+        except cv2.error:
+            break
+
+        if not _contour_consensus_props_plausible(
+            candidate
+        ):
+            break
+
+        residual = _contour_consensus_residual_px(
+            pts,
+            candidate,
+        )
+
+        new_inliers = (
+            residual <= threshold_px
+        )
+
+        props = candidate
+
+        if np.array_equal(
+            new_inliers,
+            inliers,
+        ):
+            inliers = new_inliers
+            break
+
+        inliers = new_inliers
+
+    if int(inliers.sum()) < 5:
+        return None, inliers
+
+    consensus = (
+        pts[inliers]
+        .reshape(-1, 1, 2)
+        .astype(np.float32)
+    )
+
+    try:
+        final_props = _fit_single_ellipse(
+            consensus
+        )
+    except cv2.error:
+        return None, inliers
+
+    if not _contour_consensus_props_plausible(
+        final_props
+    ):
+        return None, inliers
+
+    residual = _contour_consensus_residual_px(
+        pts,
+        final_props,
+    )
+
+    final_inliers = (
+        residual <= threshold_px
+    )
+
+    return final_props, final_inliers
+
+
+def _contour_consensus_qc(
+    contour: np.ndarray,
+    threshold_px: float = _CONTOUR_CONSENSUS_THRESHOLD_PX,
+    min_fraction: float = _CONTOUR_CONSENSUS_MIN_FRACTION,
+    max_iterations: int = _CONTOUR_CONSENSUS_MAX_ITERATIONS,
+) -> dict:
+    """Return deterministic RANSAC contour-consensus QC diagnostics.
+
+    This is a diagnostic/quality-control operation only.  It never replaces
+    the RC4 ellipse or its measured values.
+
+    Returns
+    -------
+    dict
+        valid
+            True when a plausible ellipse is supported by at least
+            ``min_fraction`` of the physical contour points.
+
+        support_fraction
+            Fraction of contour points supporting the final consensus ellipse.
+
+        n_inliers
+            Number of supporting points.
+
+        n_points
+            Total number of physical contour points.
+
+        reason
+            Empty on pass; explicit failure reason otherwise.
+    """
+
+    pts = np.asarray(
+        contour,
+        dtype=np.float32,
+    ).reshape(-1, 2)
+
+    n_points = len(pts)
+
+    if n_points < 5:
+        return {
+            "valid": False,
+            "support_fraction": 0.0,
+            "n_inliers": 0,
+            "n_points": n_points,
+            "reason": "fewer_than_5_points",
+        }
+
+    rng = np.random.default_rng(
+        _CONTOUR_CONSENSUS_SEED
+    )
+
+    required = int(
+        math.ceil(
+            min_fraction * n_points
+        )
+    )
+
+    early_required = int(
+        math.ceil(
+            _CONTOUR_CONSENSUS_EARLY_FRACTION
+            * n_points
+        )
+    )
+
+    best_score = None
+    best_inliers = None
+
+    for _ in range(
+        max_iterations
+    ):
+
+        idx = rng.choice(
+            n_points,
+            size=5,
+            replace=False,
+        )
+
+        sample = (
+            pts[idx]
+            .reshape(-1, 1, 2)
+            .astype(np.float32)
+        )
+
+        try:
+            props = _fit_single_ellipse(
+                sample
+            )
+        except cv2.error:
+            continue
+
+        if not _contour_consensus_props_plausible(
+            props
+        ):
+            continue
+
+        residual = _contour_consensus_residual_px(
+            pts,
+            props,
+        )
+
+        inliers = (
+            residual <= threshold_px
+        )
+
+        n_inliers = int(
+            inliers.sum()
+        )
+
+        if n_inliers < 5:
+            continue
+
+        median_residual = float(
+            np.median(
+                residual[inliers]
+            )
+        )
+
+        score = (
+            n_inliers,
+            -median_residual,
+        )
+
+        if (
+            best_score is None
+            or score > best_score
+        ):
+            best_score = score
+            best_inliers = inliers.copy()
+
+        # Runtime optimisation only:
+        # confirm a clearly high-consensus candidate after refinement,
+        # then stop.  Borderline cases are never early-accepted.
+        if n_inliers >= early_required:
+
+            _, refined_inliers = (
+                _contour_consensus_refine(
+                    pts,
+                    inliers,
+                    threshold_px,
+                )
+            )
+
+            refined_count = int(
+                refined_inliers.sum()
+            )
+
+            if refined_count >= early_required:
+
+                return {
+                    "valid": True,
+                    "support_fraction":
+                        refined_count / n_points,
+                    "n_inliers":
+                        refined_count,
+                    "n_points":
+                        n_points,
+                    "reason":
+                        "",
+                }
+
+    if best_inliers is None:
+        return {
+            "valid": False,
+            "support_fraction": 0.0,
+            "n_inliers": 0,
+            "n_points": n_points,
+            "reason": "no_plausible_model",
+        }
+
+    _, final_inliers = (
+        _contour_consensus_refine(
+            pts,
+            best_inliers,
+            threshold_px,
+        )
+    )
+
+    final_count = int(
+        final_inliers.sum()
+    )
+
+    support_fraction = (
+        final_count / n_points
+    )
+
+    valid = (
+        final_count >= required
+    )
+
+    return {
+        "valid": valid,
+        "support_fraction": support_fraction,
+        "n_inliers": final_count,
+        "n_points": n_points,
+        "reason": (
+            ""
+            if valid
+            else "low_consensus"
+        ),
+    }
+
 
 
 def _build_detection(
@@ -400,6 +878,199 @@ def _compute_ellipse_fit_quality(
 
 
 # ---------------------------------------------------------------------------
+# Body-selector: conservative consensus override (Fix 2)
+# ---------------------------------------------------------------------------
+
+def _select_body_candidate(
+    candidates: list,
+    px_to_mm: float | None,
+) -> tuple:
+    """Select the best body candidate using a conservative consensus strategy.
+
+    This function is a **pure drop-in replacement** for the historical
+    ``max(candidates, key=lambda c: c[0])`` call.  It returns the same
+    5-element tuple ``(score, props_global, global_cnt, fit_quality,
+    body_start_y_global)`` that the legacy selector would have returned.
+
+    Algorithm
+    ---------
+    1. Compute Top-1 as ``max(candidates, key=lambda c: c[0])`` — unchanged
+       historical behaviour.
+    2. If ``px_to_mm`` is None or only one candidate exists, return Top-1
+       immediately (selector disabled / no choice).
+    3. For each candidate *j* compute::
+
+           radius_j = c[j][1]["equiv_diameter_px"] / (2 * px_to_mm)
+           support_j = count(abs(radius_i - radius_j) <= BODY_CONSENSUS_RADIUS_EPS_MM
+                             for all i in candidates)
+
+    4. The consensus candidate is the one with the highest ``support_j``.
+       Tie-break: lowest ``c[3]["residual_rmse"]``.  Exact numeric ties in
+       RMSE resolve to the first candidate in list order (deterministic).
+    5. Switch condition (both must hold)::
+
+           support_consensus >= BODY_CONSENSUS_MIN_SUPPORT
+           AND rmse_ratio     >  BODY_RMSE_RATIO_THRESHOLD
+
+       where ``rmse_ratio = rmse_top1 / rmse_consensus``.
+    6. Any None / NaN / non-finite RMSE value prevents the switch.
+    7. If the switch fires, return the consensus candidate; otherwise Top-1.
+
+    Args:
+        candidates: Non-empty list of 5-tuples produced by the candidate
+                    evaluation loop inside ``_detect_drop_in_roi``.
+        px_to_mm:   Calibration factor (px/mm), or None when uncalibrated.
+
+    Returns:
+        A dict containing:
+            ``selected``   – the chosen 5-tuple candidate,
+            ``switched``   – bool, True when consensus overrides Top-1,
+            ``support``    – int support of the consensus candidate (or None),
+            ``rmse_ratio`` – float rmse_ratio (or None),
+            ``top1_radius_mm``      – float radius of Top-1 in mm (or None),
+            ``selected_radius_mm``  – float radius of selected in mm (or None).
+    """
+    # Historical Top-1 — index-based to avoid list.index() over tuples that
+    # contain np.ndarray (identity comparison via == raises ValueError).
+    # max() over range preserves the historical behaviour: first candidate wins
+    # on score ties, matching the original max(candidates, key=lambda c: c[0]).
+    top1_idx = max(range(len(candidates)), key=lambda i: candidates[i][0])
+    top1 = candidates[top1_idx]
+
+    # Initialise audit fields to safe defaults
+    _audit: dict = {
+        "selected":          top1,
+        "switched":          False,
+        "support":           None,
+        "rmse_ratio":        None,
+        "top1_radius_mm":    None,
+        "selected_radius_mm": None,
+    }
+
+    # Selector disabled: no calibration or single candidate.
+    # With px_to_mm available, populate radius diagnostics even for single candidate.
+    if len(candidates) < 2:
+        if px_to_mm is not None:
+            _r = candidates[top1_idx][1]["equiv_diameter_px"] / (2.0 * px_to_mm)
+            _audit["top1_radius_mm"]     = _r
+            _audit["selected_radius_mm"] = _r
+        return _audit
+    if px_to_mm is None:
+        return _audit
+
+    # ------------------------------------------------------------------ #
+    # Compute radii in mm for all candidates
+    # ------------------------------------------------------------------ #
+    radii_mm: list[float] = [
+        c[1]["equiv_diameter_px"] / (2.0 * px_to_mm)
+        for c in candidates
+    ]
+
+    _audit["top1_radius_mm"] = radii_mm[top1_idx]
+
+    # ------------------------------------------------------------------ #
+    # Compute support for every candidate
+    # ------------------------------------------------------------------ #
+    n = len(candidates)
+    supports: list[int] = []
+    for j in range(n):
+        sup = sum(
+            1
+            for i in range(n)
+            if abs(radii_mm[i] - radii_mm[j]) <= BODY_CONSENSUS_RADIUS_EPS_MM
+        )
+        supports.append(sup)
+
+    max_support = max(supports)
+
+    # ------------------------------------------------------------------ #
+    # Consensus candidate: max support → min RMSE tie-break
+    # ------------------------------------------------------------------ #
+    consensus_idx: int | None = None
+    best_rmse_for_consensus: float = math.inf
+
+    for j in range(n):
+        if supports[j] != max_support:
+            continue
+        rmse_j = candidates[j][3].get("residual_rmse")
+        # None / NaN / non-finite RMSE: treat as very large (never wins tie-break
+        # unless ALL tied candidates have bad RMSE, in which case list order wins)
+        if rmse_j is None or not math.isfinite(rmse_j):
+            rmse_j = math.inf
+        if rmse_j < best_rmse_for_consensus:
+            best_rmse_for_consensus = rmse_j
+            consensus_idx = j
+
+    if consensus_idx is None:
+        # Defensive: should not happen with a non-empty candidates list
+        return _audit
+
+    _audit["support"] = max_support
+    _audit["selected_radius_mm"] = radii_mm[top1_idx]  # default = top1
+
+    # ------------------------------------------------------------------ #
+    # Switch guard: support AND rmse_ratio
+    # ------------------------------------------------------------------ #
+    if max_support < BODY_CONSENSUS_MIN_SUPPORT:
+        return _audit
+
+    rmse_top1      = candidates[top1_idx][3].get("residual_rmse")
+    rmse_consensus = candidates[consensus_idx][3].get("residual_rmse")
+
+    # Any non-finite RMSE → no switch
+    if (
+        rmse_top1      is None or not math.isfinite(rmse_top1)
+        or rmse_consensus is None or not math.isfinite(rmse_consensus)
+        or rmse_consensus == 0.0
+    ):
+        return _audit
+
+    rmse_ratio = rmse_top1 / rmse_consensus
+    _audit["rmse_ratio"] = rmse_ratio
+
+    if rmse_ratio <= BODY_RMSE_RATIO_THRESHOLD:   # strictly > required
+        return _audit
+
+    # Switch fires
+    _audit["selected"]          = candidates[consensus_idx]
+    _audit["switched"]          = True
+    _audit["selected_radius_mm"] = radii_mm[consensus_idx]
+
+    logger.debug(
+        "_select_body_candidate: SWITCH — support=%d  rmse_ratio=%.4f  "
+        "top1_r=%.4f mm → consensus_r=%.4f mm",
+        max_support, rmse_ratio,
+        radii_mm[top1_idx], radii_mm[consensus_idx],
+    )
+    return _audit
+
+
+def _select_body_candidate_pool(
+    primary_candidates: list,
+    fallback_candidates: list,
+    px_to_mm: float | None,
+) -> dict:
+    """Select from primary BODY candidates before considering fallbacks.
+
+    Fallback candidates are strictly rescue-only: they are considered only
+    when no normal neck->body candidate survives all detector filters.
+    They never compete with normal BODY candidates.
+    """
+    if primary_candidates:
+        pool = primary_candidates
+        used_fallback = False
+    elif fallback_candidates:
+        pool = fallback_candidates
+        used_fallback = True
+    else:
+        raise ValueError("at least one BODY candidate pool must be non-empty")
+
+    result = dict(_select_body_candidate(pool, px_to_mm))
+    result["used_fallback"] = used_fallback
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Hough + dynamic-ROI ellipse detector (one drop per call)
 # ---------------------------------------------------------------------------
 
@@ -411,6 +1082,7 @@ def _detect_drop_in_roi(
     y1: int,
     roi_label: str,
     frame_h: int,
+    px_to_mm: float | None = None,
     blur_kernel: int = 7,
     clip_limit: float = 3.0,
     min_radius: int = 12,
@@ -423,6 +1095,7 @@ def _detect_drop_in_roi(
     max_major: float = 125.0,
     min_minor: float = 25.0,
     max_minor: float = 100.0,
+    fixed_body_start_y_global: int | None = None,
 ) -> "tuple[tuple[dict, np.ndarray], dict] | tuple[None, dict]":
     """Detect one pendant drop: Hough coarse localisation + ellipse fine fit.
 
@@ -477,6 +1150,39 @@ def _detect_drop_in_roi(
     """
     h = frame_h
 
+    # Optional physical BODY boundary.
+    #
+    # The coordinate is expressed in GLOBAL frame pixels.  None preserves
+    # the automatic RC3 neck->body / Hough-fallback behaviour unchanged.
+    # Explicit values are never silently clamped.
+    if fixed_body_start_y_global is not None:
+        if (
+            isinstance(fixed_body_start_y_global, bool)
+            or not isinstance(
+                fixed_body_start_y_global,
+                (int, np.integer),
+            )
+        ):
+            raise ValueError(
+                "fixed_body_start_y_global must be an integer "
+                "global-frame Y coordinate or None"
+            )
+
+        fixed_body_start_y_global = int(
+            fixed_body_start_y_global
+        )
+
+        if not (
+            y0
+            <= fixed_body_start_y_global
+            < y1
+        ):
+            raise ValueError(
+                "fixed_body_start_y_global must lie inside "
+                f"the ROI vertical interval [{y0}, {y1}); "
+                f"got {fixed_body_start_y_global}"
+            )
+
     # Centre-y acceptance window in global frame coordinates
     cy_min_global = int(0.06 * h)
     cy_max_global = int(0.32 * h)
@@ -518,6 +1224,12 @@ def _detect_drop_in_roi(
         "body_start_y_global":        None,
         "n_contour_points":           None,
         "method_final":               "",
+        # Body-selector audit fields (Fix 2)
+        "body_selector_switched":         None,
+        "body_selector_support":          None,
+        "body_selector_rmse_ratio":       None,
+        "body_selector_top1_radius_mm":   None,
+        "body_selector_selected_radius_mm": None,
     }
     _best_diag_level: int = -1   # tracks deepest bodyellipse stage reached
 
@@ -535,7 +1247,8 @@ def _detect_drop_in_roi(
     # ------------------------------------------------------------------
     # 4–5. Evaluate every Hough candidate
     # ------------------------------------------------------------------
-    candidates: list[tuple[float, dict, np.ndarray, dict]] = []  # (score, props_global, global_cnt, fit_quality)
+    primary_candidates: list[tuple] = []
+    fallback_candidates: list[tuple] = []
     rejected_shape: int = 0
 
     for idx, circle in enumerate(circles_round):
@@ -666,6 +1379,7 @@ def _detect_drop_in_roi(
         _SUSTAIN_ROWS = 4
 
         body_start_y: int | None = None
+        used_hough_fallback = False
 
         # Collect the first _NECK_ROWS occupied (width > 0) row widths
         occupied_rows = [(ry, w) for ry, w in enumerate(row_widths) if w > 0]
@@ -712,21 +1426,71 @@ def _detect_drop_in_roi(
                 roi_label, idx, _NECK_ROWS, len(occupied_rows),
             )
 
-        if body_start_y is None:
-            logger.debug(
-                "ROI [%s] circle #%d: could not find body_start_y "
-                "(body_max_width=%d) — skipping.",
-                roi_label, idx, body_max_width,
+        if fixed_body_start_y_global is not None:
+            # Convert the user-supplied GLOBAL physical boundary into the
+            # current dynamic-crop coordinate system.
+            fixed_body_start_y_local = (
+                fixed_body_start_y_global
+                - (y0 + dy0)
             )
-            if _best_diag_level < 2:
-                _best_diag.update({
-                    "bodyellipse_failure_reason": "body_start_not_found",
-                    "body_max_width": body_max_width,
-                })
-                _best_diag_level = 2
-            continue
 
-        # Global y of the body start (for logging and diagnostic overlay)
+            # A candidate whose dynamic crop does not contain the physical
+            # boundary cannot represent that requested measurement.  Skip it
+            # rather than clipping or moving the boundary.
+            if not (
+                0
+                <= fixed_body_start_y_local
+                < dyn_h
+            ):
+                logger.debug(
+                    "ROI [%s] circle #%d: fixed BODY boundary global y=%d "
+                    "lies outside dynamic crop global y=[%d, %d) — skipping.",
+                    roi_label,
+                    idx,
+                    fixed_body_start_y_global,
+                    y0 + dy0,
+                    y0 + dy1,
+                )
+                continue
+
+            body_start_y = int(
+                fixed_body_start_y_local
+            )
+
+            # An explicit physical boundary is not a Hough fallback.
+            used_hough_fallback = False
+
+            logger.debug(
+                "ROI [%s] circle #%d: using fixed physical BODY boundary "
+                "global y=%d -> local y=%d.",
+                roi_label,
+                idx,
+                fixed_body_start_y_global,
+                body_start_y,
+            )
+
+        elif body_start_y is None:
+            used_hough_fallback = True
+
+            # RC3 fallback:
+            # Hough has already localised the drop.  Failure to observe the
+            # neck->body width transition must therefore not, by itself,
+            # erase the candidate.  Use the Hough-centre row as a conservative
+            # lower-arc cutoff and retain only real contour points at/below it.
+            #
+            # hcy is expressed in fixed-ROI coordinates; dy0 is the dynamic
+            # crop origin in those same coordinates.
+            body_start_y = int(
+                np.clip(hcy - dy0, 0, dyn_h - 1)
+            )
+
+            logger.debug(
+                "ROI [%s] circle #%d: body_start_y transition not found; "
+                "using Hough-centre fallback y=%d.",
+                roi_label, idx, body_start_y,
+            )
+
+        # Global y of the body start/cutoff
         body_start_y_global = y0 + dy0 + body_start_y
 
         logger.debug(
@@ -930,40 +1694,74 @@ def _detect_drop_in_roi(
             area_px, distance, score,
         )
 
-        candidates.append((score, props_g, global_cnt, _fit_quality, body_start_y_global))
+        candidate = (
+            score,
+            props_g,
+            global_cnt,
+            _fit_quality,
+            body_start_y_global,
+        )
+
+        if used_hough_fallback:
+            fallback_candidates.append(candidate)
+        else:
+            primary_candidates.append(candidate)
 
     # ------------------------------------------------------------------
     # 6. Select best candidate
     # ------------------------------------------------------------------
-    n_passed = len(candidates)
+    n_primary = len(primary_candidates)
+    n_fallback = len(fallback_candidates)
+    n_passed = n_primary + n_fallback
     logger.debug(
         "ROI [%s]: %d / %d Hough circle(s) passed all filters "
         "(%d rejected by shape).",
         roi_label, n_passed, n_circles, rejected_shape,
     )
 
-    if not candidates:
+    if not primary_candidates and not fallback_candidates:
         # Bodyellipse succeeded internally but every candidate was rejected
         # by the geometric filters (axis size / centre-y / edge / shape).
         if _best_diag_level == 5:
             _best_diag["bodyellipse_failure_reason"] = "geometry_filter_rejected"
         return None, _best_diag
 
-    best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = max(candidates, key=lambda t: t[0])
+    # ------------------------------------------------------------------
+    # 6. Select final candidate — conservative consensus override (Fix 2)
+    # ------------------------------------------------------------------
+    _selector_result = _select_body_candidate_pool(
+        primary_candidates=primary_candidates,
+        fallback_candidates=fallback_candidates,
+        px_to_mm=px_to_mm,
+    )
+    best_score, best_props, best_cnt_global, best_fit_quality, best_body_start_y_global = _selector_result["selected"]
 
     logger.debug(
-        "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f",
+        "ROI [%s] selected: center=(%.1f, %.1f)  major=%.1f  minor=%.1f  score=%.2f  "
+        "selector_switched=%s",
         roi_label,
         best_props["center_x"], best_props["center_y"],
         best_props["major_axis"], best_props["minor_axis"],
         best_score,
+        _selector_result["switched"],
     )
 
     # Winning candidate used bodyellipse successfully
-    _best_diag["bodyellipse_used"]        = True
-    _best_diag["method_final"]            = "hough+adaptive+close+bodyellipse"
+    _best_diag["bodyellipse_used"] = True
+    _best_diag["body_fallback_used"] = _selector_result["used_fallback"]
+    _best_diag["method_final"] = (
+        "hough+adaptive+close+bodyellipse+hough_center_fallback"
+        if _selector_result["used_fallback"]
+        else "hough+adaptive+close+bodyellipse"
+    )
     _best_diag["bodyellipse_fit_quality"] = best_fit_quality
     _best_diag["body_start_y_global"]     = best_body_start_y_global  # winner's cut
+    # Body-selector audit (Fix 2)
+    _best_diag["body_selector_switched"]           = _selector_result["switched"]
+    _best_diag["body_selector_support"]            = _selector_result["support"]
+    _best_diag["body_selector_rmse_ratio"]         = _selector_result["rmse_ratio"]
+    _best_diag["body_selector_top1_radius_mm"]     = _selector_result["top1_radius_mm"]
+    _best_diag["body_selector_selected_radius_mm"] = _selector_result["selected_radius_mm"]
     return (best_props, best_cnt_global), _best_diag
 
 
@@ -977,6 +1775,8 @@ def detect_bubbles(
     px_to_mm: float | None = None,
     blur_kernel: int = 7,
     clip_limit: float = 3.0,
+    control_body_start_y_global: int | None = None,
+    sample_body_start_y_global: int | None = None,
 ) -> dict[str, "BubbleDetection | None | dict"]:
     """Detect two simultaneous pendant drops and classify them spatially.
 
@@ -1053,6 +1853,7 @@ def detect_bubbles(
         c_x0, c_y0, c_x1, c_y1,
         roi_label="control",
         frame_h=h,
+        px_to_mm=px_to_mm,
         blur_kernel=blur_kernel,
         clip_limit=clip_limit,
         min_radius=_MIN_RADIUS,
@@ -1065,6 +1866,7 @@ def detect_bubbles(
         max_major=_MAX_MAJOR,
         min_minor=_MIN_MINOR,
         max_minor=_MAX_MINOR,
+        fixed_body_start_y_global=control_body_start_y_global,
     )
 
     sample_result, samp_diag = _detect_drop_in_roi(
@@ -1072,6 +1874,7 @@ def detect_bubbles(
         s_x0, s_y0, s_x1, s_y1,
         roi_label="sample",
         frame_h=h,
+        px_to_mm=px_to_mm,
         blur_kernel=blur_kernel,
         clip_limit=clip_limit,
         min_radius=_MIN_RADIUS,
@@ -1084,17 +1887,21 @@ def detect_bubbles(
         max_major=_MAX_MAJOR,
         min_minor=_MIN_MINOR,
         max_minor=_MAX_MINOR,
+        fixed_body_start_y_global=sample_body_start_y_global,
     )
 
     _audit = {"control": ctrl_diag, "sample": samp_diag}
 
+    # FIX 5: cada ROI sobrevive independientemente.
+    #
+    # Un fallo unilateral NO debe borrar una detección válida del lado
+    # contralateral. Los diagnósticos de ambos ROI se conservan siempre.
     if control_result is None:
         logger.error(
             "ROI [control]: detection failed — no Hough circle survived the "
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return {"control": None, "sample": None, "_audit": _audit}
 
     if sample_result is None:
         logger.error(
@@ -1102,54 +1909,125 @@ def detect_bubbles(
             "size / position / edge filters. "
             "Check ROI bounds, Hough parameters, or size thresholds."
         )
-        return {"control": None, "sample": None, "_audit": _audit}
 
-    left_props,  left_cnt  = control_result
-    right_props, right_cnt = sample_result
-
-    # ------------------------------------------------------------------
-    # Spatial classification (unbreakable rule)
-    #
-    #   left  ROI → label = 'control'
-    #   right ROI → label = 'sample'
-    # ------------------------------------------------------------------
-    logger.debug(
-        "Spatial classification: control centroid_x=%.1f | sample centroid_x=%.1f",
-        left_props["center_x"],
-        right_props["center_x"],
-    )
+    detection_control = None
+    detection_sample = None
 
     # ------------------------------------------------------------------
-    # Build BubbleDetection objects with physical conversion
+    # Spatial classification remains fixed:
+    # left ROI -> control; right ROI -> sample.
+    # Build only the detections that actually exist.
     # ------------------------------------------------------------------
-    detection_control = _build_detection(
-        left_props,  left_cnt,  px_to_mm, label="control"
-    )
-    detection_sample  = _build_detection(
-        right_props, right_cnt, px_to_mm, label="sample"
-    )
+    if control_result is not None:
+        left_props, left_cnt = control_result
 
-    # Attach bodyellipse fit-quality fields (diagnostic only — never used in
-    # detection, filtering, scoring, measurement, or calibration)
-    for _det, _diag in ((detection_control, ctrl_diag), (detection_sample, samp_diag)):
+        logger.debug(
+            "Spatial classification: control centroid_x=%.1f",
+            left_props["center_x"],
+        )
+
+        detection_control = _build_detection(
+            left_props,
+            left_cnt,
+            px_to_mm,
+            label="control",
+        )
+
+    if sample_result is not None:
+        right_props, right_cnt = sample_result
+
+        logger.debug(
+            "Spatial classification: sample centroid_x=%.1f",
+            right_props["center_x"],
+        )
+
+        detection_sample = _build_detection(
+            right_props,
+            right_cnt,
+            px_to_mm,
+            label="sample",
+        )
+
+    # Attach bodyellipse fit-quality fields independently.
+    # Diagnostic only — never used in detection/scoring.
+    for _det, _diag, _fixed_body_y in (
+        (
+            detection_control,
+            ctrl_diag,
+            control_body_start_y_global,
+        ),
+        (
+            detection_sample,
+            samp_diag,
+            sample_body_start_y_global,
+        ),
+    ):
+        if _det is None:
+            continue
+
+        # FIX 8: contour-consensus QC.
+        #
+        # Operates only on the physical contour already selected by RC4.
+        # It does NOT refit/replace the production ellipse and does NOT
+        # modify any measured geometric or physical quantity.
+        #
+        # Historical wiring tests use lightweight mock detections
+        # (SimpleNamespace) that predate the contour contract.  Those mocks
+        # must preserve their historical behaviour.  Every real
+        # BubbleDetection has a ``contour`` attribute and therefore enters
+        # the Fix 8 QC normally.
+        # Fix 8 is applicable only when this side uses an explicit
+        # physical BODY boundary.  Automatic BODY keeps RC4 semantics.
+        _consensus_applicable = (
+            _fixed_body_y is not None
+            and hasattr(_det, "contour")
+        )
+
+        _det.contour_consensus_applicable = bool(
+            _consensus_applicable
+        )
+
+        if _consensus_applicable:
+            _consensus = _contour_consensus_qc(
+                _det.contour
+            )
+
+            _det.contour_consensus_valid = bool(
+                _consensus["valid"]
+            )
+            _det.contour_consensus_support_fraction = float(
+                _consensus["support_fraction"]
+            )
+            _det.contour_consensus_n_inliers = int(
+                _consensus["n_inliers"]
+            )
+            _det.contour_consensus_n_points = int(
+                _consensus["n_points"]
+            )
+            _det.contour_consensus_rejection_reason = str(
+                _consensus["reason"]
+            )
+
         _fq = _diag.get("bodyellipse_fit_quality", {})
-        _det.bodyellipse_fit_point_count  = _fq.get("fit_point_count")
+
+        _det.bodyellipse_fit_point_count = _fq.get("fit_point_count")
         _det.bodyellipse_contour_area_px2 = _fq.get("contour_area_px2")
         _det.bodyellipse_ellipse_area_px2 = _fq.get("ellipse_area_px2")
-        _det.bodyellipse_area_ratio       = _fq.get("area_ratio")
-        _det.bodyellipse_iou              = _fq.get("iou")
-        _det.bodyellipse_residual_mean    = _fq.get("residual_mean")
-        _det.bodyellipse_residual_rmse    = _fq.get("residual_rmse")
-        _det.bodyellipse_residual_p95     = _fq.get("residual_p95")
-        # Diagnostic fields exported to CSV (never used in detection/scoring)
+        _det.bodyellipse_area_ratio = _fq.get("area_ratio")
+        _det.bodyellipse_iou = _fq.get("iou")
+        _det.bodyellipse_residual_mean = _fq.get("residual_mean")
+        _det.bodyellipse_residual_rmse = _fq.get("residual_rmse")
+        _det.bodyellipse_residual_p95 = _fq.get("residual_p95")
+
+        # Diagnostic fields exported to CSV.
         _det.body_start_y_global = _diag.get("body_start_y_global")
-        _det.body_start_y_local  = _diag.get("body_start_y_local")
-        _det.body_max_width      = _diag.get("body_max_width")
+        _det.body_start_y_local = _diag.get("body_start_y_local")
+        _det.body_max_width = _diag.get("body_max_width")
 
     return {
         "control": detection_control,
-        "sample":  detection_sample,
-        "_audit":  _audit,
+        "sample": detection_sample,
+        "_audit": _audit,
     }
 
 # ---------------------------------------------------------------------------
