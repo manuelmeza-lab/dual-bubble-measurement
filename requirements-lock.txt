@@ -1,5 +1,5 @@
 # BubbleCV Dual — reproducible environment
-# Reference environment validated for v0.2.1 development
+# Reference environment validated for v0.2.1
 # Python 3.9.6
 # Generated from the environment used for the clean-room and guided-runner validation.
 #

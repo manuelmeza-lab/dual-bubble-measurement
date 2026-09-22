@@ -265,7 +265,7 @@ def main() -> int:
     print()
     print("=" * 72)
     print("BubbleCV Dual — Guided Runner")
-    print("v0.2.1 development")
+    print("v0.2.1")
     print("=" * 72)
     print()
     print("Convención fija:")
@@ -495,7 +495,7 @@ def main() -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
     manifest = {
-        "bubblecv_guided_runner": "v0.2.1-development",
+        "bubblecv_guided_runner": "v0.2.1",
         "status": "running",
         "started_at_utc": started_at,
         "input": {
