@@ -1,148 +1,274 @@
-# Guía de Instalación — macOS
+# Guía de instalación — macOS
 
-Esta guía cubre la instalación completa de BubbleCV en macOS.
+Esta guía cubre la instalación de BubbleCV Dual en macOS.
 
----
-
-## Requisitos
-
-- macOS 12 Monterey o posterior (también funciona en versiones anteriores)
-- Terminal (viene incluida en macOS: `/Applications/Utilities/Terminal.app`)
-- Python ≥ 3.9
+El entorno de referencia de `v0.2.1` fue validado en macOS ARM64 con
+Python 3.9.6.
 
 ---
 
-## 1. Instalar Python
+## 1. Requisitos
 
-### Opción A — Homebrew (recomendada)
+Necesitas:
 
-Homebrew es el gestor de paquetes más popular para macOS y facilita
-la gestión de Python sin interferir con el Python del sistema.
+- macOS;
+- Python ≥ 3.9;
+- Git;
+- Terminal;
+- conexión a Internet durante la instalación.
 
-```bash
-# Instalar Homebrew si no está instalado
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Instalar Python
-brew install python
-
-# Verificar
-python3 --version
-```
-
-> **Nota para Apple Silicon (M1/M2/M3):** Si usas un Mac con chip Apple
-> Silicon, Homebrew se instala en `/opt/homebrew/`. Asegúrate de que
-> `/opt/homebrew/bin` esté en tu `PATH`. El instalador de Homebrew lo
-> configura automáticamente.
-
-### Opción B — Instalador oficial
-
-1. Descarga el instalador desde [python.org/downloads](https://www.python.org/downloads/)
-2. Ejecuta el archivo `.pkg`
-3. Al terminar, abre Terminal y verifica:
-   ```bash
-   python3 --version
-   ```
+`ffmpeg` y `ffprobe` son recomendables para inspeccionar y convertir videos.
 
 ---
 
-## 2. Clonar el repositorio
+## 2. Instalar Homebrew
 
-```bash
-git clone https://github.com/TU_USUARIO/bubble-measurement.git
-cd bubble-measurement
-```
+Si todavía no tienes Homebrew, abre Terminal y ejecuta:
 
----
+`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 
-## 3. Crear y activar el entorno virtual
-
-```bash
-# Crear el entorno virtual
-python3 -m venv venv
-
-# Activar
-source venv/bin/activate
-```
-
-Cuando el entorno está activo, verás `(venv)` al inicio del prompt:
-```
-(venv) nombre@mac bubble-measurement %
-```
-
-> **Importante:** Cada vez que abras una nueva ventana de Terminal,
-> debes volver a activar el entorno virtual con `source venv/bin/activate`.
+Después cierra y vuelve a abrir Terminal si el instalador lo solicita.
 
 ---
 
-## 4. Instalar dependencias
+## 3. Instalar Python, Git y ffmpeg
+
+Ejecuta:
+
+`brew install python git ffmpeg`
+
+Verifica:
+
+`python3 --version`
+
+`git --version`
+
+`ffprobe -version`
+
+---
+
+## 4. Clonar BubbleCV
+
+Ejecuta:
+
+`git clone https://github.com/manuelmeza-lab/dual-bubble-measurement.git`
+
+Después entra a la carpeta:
+
+`cd dual-bubble-measurement`
+
+---
+
+## 5. Crear un entorno virtual
+
+Dentro de la carpeta del proyecto ejecuta:
+
+`python3 -m venv venv`
+
+Actívalo:
+
+`source venv/bin/activate`
+
+Cuando esté activo aparecerá normalmente:
+
+`(venv)`
+
+al inicio de la línea de Terminal.
+
+Cada vez que abras una Terminal nueva debes volver a activar el entorno.
+
+Por ejemplo:
+
+`cd /ruta/a/dual-bubble-measurement`
+
+`source venv/bin/activate`
+
+---
+
+## 6. Actualizar pip
 
 Con el entorno virtual activo:
 
-```bash
-pip install -r requirements.txt
-```
+`python -m pip install --upgrade pip`
 
 ---
 
-## 5. Verificar la instalación
+## 7. Instalar dependencias
 
-```bash
-python analyze_image.py --help
-```
+### Entorno reproducible de referencia
 
-Deberías ver el mensaje de ayuda con todas las opciones disponibles.
+Para reproducir el entorno exacto utilizado durante la validación de
+`v0.2.1`:
 
----
+`python -m pip install -r requirements-lock.txt`
 
-## Problemas comunes en macOS
+Este lock fue validado con:
 
-### Error: "python3: command not found"
+- Python 3.9.6;
+- macOS ARM64;
+- OpenCV 5.0.0;
+- NumPy 2.0.2;
+- Pandas 2.3.3;
+- Matplotlib 3.9.4.
 
-Homebrew no está en el PATH. Agrega esto a tu `~/.zshrc`:
-```bash
-export PATH="/opt/homebrew/bin:$PATH"   # Apple Silicon
-# o
-export PATH="/usr/local/bin:$PATH"      # Intel
-```
-Luego: `source ~/.zshrc`
+### Instalación flexible
 
-### Error: "Operation not permitted" al acceder a videos
+También existe:
 
-macOS protege el acceso a ciertos directorios. Solución:
-- Ve a **Ajustes del Sistema → Privacidad y Seguridad → Acceso total al disco**
-- Agrega Terminal (o el editor que uses)
+`requirements.txt`
 
-### Advertencia de "quarantine" al ejecutar scripts descargados
+con las dependencias mínimas/flexibles del proyecto.
 
-```bash
-# Eliminar el atributo de cuarentena (ejecutar una vez en la carpeta del proyecto)
-xattr -rd com.apple.quarantine /ruta/al/proyecto/
-```
-
-### Error al leer archivos `.mov` (codec no soportado)
-
-```bash
-# Instalar ffmpeg para soporte completo de codecs
-brew install ffmpeg
-
-# Reinstalar OpenCV con soporte headless (más compatible con codecs)
-pip uninstall opencv-python
-pip install opencv-python-headless
-```
-
-Consulta también → [`docs/video_conversion.md`](./video_conversion.md)
-
-### La computadora se suspende durante análisis largos
-
-Consulta → [`docs/prevent_sleep.md`](./prevent_sleep.md)
+Para una computadora destinada al análisis reproducible se recomienda utilizar
+`requirements-lock.txt` cuando sea compatible con la plataforma.
 
 ---
 
-## Desactivar el entorno virtual
+## 8. Comprobar dependencias
 
-Cuando termines de trabajar:
+Ejecuta:
 
-```bash
-deactivate
-```
+`python -m pip check`
+
+En una instalación correcta debe aparecer:
+
+`No broken requirements found.`
+
+---
+
+## 9. Ejecutar los tests
+
+Ejecuta:
+
+`python -m unittest discover -s tests -p 'test_*.py'`
+
+La suite debe terminar con:
+
+`OK`
+
+Puede aparecer algún test marcado como `skipped` cuando depende de datos
+históricos externos que no se incluyen en el repositorio.
+
+---
+
+## 10. Primera corrida
+
+La forma recomendada de iniciar BubbleCV es:
+
+`python run_bubblecv.py`
+
+Después sigue la guía:
+
+→ [`quickstart.md`](./quickstart.md)
+
+El Guided Runner solicitará paso a paso:
+
+- video;
+- calibración;
+- FPS;
+- skip;
+- BODY de CONTROL;
+- BODY de SAMPLE;
+- parámetros de análisis;
+- carpeta de resultados.
+
+Antes de ejecutar mostrará la configuración completa y pedirá confirmación.
+
+---
+
+## 11. Verificar ffprobe
+
+Si BubbleCV no muestra información de codec, resolución o FPS, ejecuta:
+
+`ffprobe -version`
+
+Si no existe:
+
+`brew install ffmpeg`
+
+El Guided Runner puede funcionar sin `ffprobe`, pero disponer de esta
+herramienta facilita la revisión del video y de su cadencia.
+
+---
+
+## 12. Problemas comunes
+
+### `python3: command not found`
+
+Comprueba Homebrew:
+
+`brew --prefix`
+
+En Macs con Apple Silicon suele encontrarse en:
+
+`/opt/homebrew`
+
+Si acabas de instalar Homebrew, cierra Terminal y vuelve a abrirla.
+
+---
+
+### `git: command not found`
+
+Instala Git con:
+
+`brew install git`
+
+---
+
+### El video no puede ser leído
+
+Se recomienda utilizar MP4 con codec H.264.
+
+Consulta:
+
+→ [`video_conversion.md`](./video_conversion.md)
+
+---
+
+### macOS impide acceder a la carpeta del video
+
+Revisa:
+
+**Ajustes del Sistema → Privacidad y Seguridad**
+
+y concede a Terminal permiso para acceder a la ubicación correspondiente si
+macOS lo solicita.
+
+No es necesario conceder acceso total al disco de forma preventiva si el
+sistema no lo requiere.
+
+---
+
+### La computadora se suspende durante una corrida larga
+
+Consulta:
+
+→ [`prevent_sleep.md`](./prevent_sleep.md)
+
+---
+
+## 13. Resultados
+
+El Guided Runner crea por defecto una carpeta dentro de:
+
+`results/`
+
+con un nombre basado en el video y la fecha/hora de ejecución.
+
+Los archivos principales son:
+
+- `results.csv`;
+- `binned.csv`;
+- `summary.csv`;
+- `run_manifest.json`;
+- gráficas PNG.
+
+La carpeta `results/` está excluida del repositorio mediante `.gitignore`.
+
+---
+
+## 14. Desactivar el entorno
+
+Cuando termines:
+
+`deactivate`

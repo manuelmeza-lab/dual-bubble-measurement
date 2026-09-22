@@ -1,154 +1,306 @@
-# Guía de Instalación — Windows
+# Guía de instalación — Windows
 
-Esta guía cubre la instalación completa de BubbleCV en Windows 10 y 11.
+Esta guía cubre la instalación de BubbleCV Dual en Windows 10 y Windows 11.
 
----
+El entorno exacto contenido en `requirements-lock.txt` de `v0.2.1` fue
+validado de forma independiente en macOS ARM64 con Python 3.9.6.
 
-## Requisitos
-
-- Windows 10 (versión 1903 o posterior) o Windows 11
-- PowerShell o Command Prompt (CMD)
-- Python ≥ 3.9
-
----
-
-## 1. Instalar Python
-
-1. Descarga el instalador desde [python.org/downloads](https://www.python.org/downloads/)
-   (elige la versión marcada como "Recommended")
-2. Ejecuta el archivo `.exe`
-3. **Importante:** En la primera pantalla del instalador, marca la casilla:
-   ✅ **"Add Python to PATH"**
-
-   Sin esta opción, Python no estará disponible en la terminal.
-
-4. Haz clic en **"Install Now"**
-
-5. Verifica abriendo PowerShell o CMD:
-   ```
-   python --version
-   ```
+La instalación en Windows está soportada por la especificación general de
+dependencias, pero el lock exacto todavía no cuenta con una validación
+clean-room independiente en Windows.
 
 ---
 
-## 2. Clonar el repositorio
+## 1. Requisitos
+
+Necesitas:
+
+- Windows 10 u 11;
+- Python ≥ 3.9;
+- PowerShell o Command Prompt;
+- conexión a Internet durante la instalación.
+
+Git es recomendable, aunque también puedes descargar el repositorio como ZIP.
+
+`ffmpeg` y `ffprobe` son recomendables para inspeccionar y convertir videos.
+
+---
+
+## 2. Instalar Python
+
+Descarga Python desde:
+
+https://www.python.org/downloads/
+
+Durante la instalación activa la opción:
+
+`Add Python to PATH`
+
+Después abre una nueva ventana de PowerShell y verifica:
+
+`python --version`
+
+Debe mostrar Python 3.9 o posterior.
+
+---
+
+## 3. Obtener BubbleCV
+
+### Opción A — Git
 
 Si tienes Git instalado:
-```powershell
-git clone https://github.com/TU_USUARIO/bubble-measurement.git
-cd bubble-measurement
-```
 
-Si no tienes Git, descarga el ZIP desde GitHub:
-- Haz clic en **Code → Download ZIP**
-- Descomprime en la carpeta que prefieras
+`git clone https://github.com/manuelmeza-lab/dual-bubble-measurement.git`
 
----
+Después:
 
-## 3. Crear y activar el entorno virtual
+`cd dual-bubble-measurement`
 
-Abre PowerShell o CMD y navega a la carpeta del proyecto:
+### Opción B — ZIP
 
-```powershell
-cd C:\ruta\al\proyecto\bubble-measurement
-```
+En GitHub selecciona:
 
-Crea el entorno virtual:
-```powershell
-python -m venv venv
-```
+`Code → Download ZIP`
 
-**Activa el entorno virtual:**
-
-| Terminal | Comando |
-|----------|---------|
-| PowerShell | `venv\Scripts\Activate.ps1` |
-| CMD | `venv\Scripts\activate.bat` |
-
-Cuando el entorno está activo, verás `(venv)` al inicio del prompt:
-```
-(venv) PS C:\ruta\al\proyecto>
-```
-
-### Error de ejecución en PowerShell
-
-Si PowerShell bloquea la ejecución del script, ejecuta **una sola vez**:
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-Luego activa el entorno normalmente.
+Descomprime el archivo y abre PowerShell dentro de la carpeta del proyecto.
 
 ---
 
-## 4. Instalar dependencias
+## 4. Crear el entorno virtual
 
-Con el entorno virtual activo:
+Desde la carpeta de BubbleCV ejecuta:
 
-```powershell
-pip install -r requirements.txt
-```
+`python -m venv venv`
 
 ---
 
-## 5. Verificar la instalación
+## 5. Activar el entorno
 
-```powershell
-python analyze_image.py --help
-```
+### PowerShell
 
-Deberías ver el mensaje de ayuda con todas las opciones disponibles.
+`venv\Scripts\Activate.ps1`
 
----
+### Command Prompt
 
-## Rutas en Windows: diferencia importante
+`venv\Scripts\activate.bat`
 
-En Windows, las rutas usan `\` en lugar de `/`. Sin embargo, los scripts
-de BubbleCV también aceptan `/` en la mayoría de los casos.
+Cuando esté activo aparecerá normalmente:
 
-**Ejemplos de rutas válidas en Windows:**
-```powershell
-# Con backslash (estilo Windows)
-python analyze_video.py --input path\to\video.mp4 --calibration PX_PER_MM
+`(venv)`
 
-# Con slash (funciona en Python)
-python analyze_video.py --input path/to/video.mp4 --calibration PX_PER_MM
-```
+al inicio de la línea de comandos.
 
-Si la ruta contiene espacios, enciérrala en comillas:
-```powershell
-python analyze_video.py --input "C:\Mi Carpeta\video.mp4" --calibration PX_PER_MM
-```
+Cada vez que abras una terminal nueva tendrás que volver a activar el entorno.
 
 ---
 
-## Problemas comunes en Windows
+## 6. Si PowerShell bloquea la activación
 
-### "python" no se reconoce como comando
+Si PowerShell impide ejecutar `Activate.ps1`, una alternativa sencilla es
+utilizar Command Prompt y activar con:
 
-Python no está en el PATH. Soluciones:
+`venv\Scripts\activate.bat`
 
-1. Reinstala Python marcando "Add Python to PATH"
-2. O agrega Python al PATH manualmente:
-   - Busca "Variables de entorno" en el menú de inicio
-   - En "Variables del sistema" → `Path` → Agregar la carpeta de Python
-     (generalmente `C:\Users\TU_USUARIO\AppData\Local\Programs\Python\Python3X\`)
+Si prefieres continuar en PowerShell, consulta la política de ejecución de tu
+sistema antes de modificarla.
 
-### Error al leer archivos `.mov`
-
-Los archivos `.mov` de iPhone o cámaras pueden tener codecs (H.265/HEVC)
-que OpenCV no soporta directamente en Windows.
-
-Solución: convertir el video a `.mp4` antes de analizarlo.
-Consulta → [`docs/video_conversion.md`](./video_conversion.md)
-
-### La computadora se suspende durante análisis largos
-
-Consulta → [`docs/prevent_sleep.md`](./prevent_sleep.md)
+No es necesario cambiar políticas de seguridad globales para utilizar
+BubbleCV.
 
 ---
 
-## Desactivar el entorno virtual
+## 7. Actualizar pip
 
-```powershell
-deactivate
-```
+Con el entorno activo:
+
+`python -m pip install --upgrade pip`
+
+---
+
+## 8. Instalar dependencias
+
+### Instalación general recomendada en Windows
+
+Ejecuta:
+
+`python -m pip install -r requirements.txt`
+
+Después comprueba:
+
+`python -m pip check`
+
+### Sobre `requirements-lock.txt`
+
+El archivo:
+
+`requirements-lock.txt`
+
+contiene las versiones exactas utilizadas en el entorno de referencia de
+`v0.2.1`.
+
+Ese lock fue reconstruido y validado con:
+
+- Python 3.9.6;
+- macOS ARM64;
+- OpenCV 5.0.0;
+- NumPy 2.0.2;
+- Pandas 2.3.3;
+- Matplotlib 3.9.4.
+
+Todavía no debe interpretarse como un lock validado independientemente en
+Windows.
+
+---
+
+## 9. Verificar la instalación
+
+Primero:
+
+`python -m pip check`
+
+Una instalación sin conflictos debe mostrar:
+
+`No broken requirements found.`
+
+Después ejecuta:
+
+`python -m unittest discover -s tests -p "test_*.py"`
+
+La suite debe terminar con:
+
+`OK`
+
+Puede aparecer algún test marcado como `skipped` cuando depende de datos
+históricos externos que no forman parte del repositorio.
+
+---
+
+## 10. Primera corrida
+
+La forma recomendada de iniciar BubbleCV es:
+
+`python run_bubblecv.py`
+
+Después sigue:
+
+→ [`quickstart.md`](./quickstart.md)
+
+El Guided Runner solicitará:
+
+- video;
+- calibración;
+- FPS;
+- skip;
+- BODY de CONTROL;
+- BODY de SAMPLE;
+- parámetros del análisis;
+- carpeta de resultados.
+
+Antes de ejecutar mostrará toda la configuración y pedirá confirmación.
+
+---
+
+## 11. Rutas de archivos
+
+Ejemplo:
+
+`C:\Users\Nombre\Videos\experimento01.mp4`
+
+Las rutas con espacios pueden introducirse directamente cuando el Guided
+Runner las solicita.
+
+Ejemplo:
+
+`C:\Users\Nombre\Mis Videos\experimento 01.mp4`
+
+El Guided Runner construye internamente el comando como una lista de
+argumentos y no utiliza `shell=True`.
+
+---
+
+## 12. ffmpeg y ffprobe
+
+`ffprobe` permite revisar datos como FPS, duración, codec y resolución.
+
+Si ya tienes ffmpeg instalado, verifica:
+
+`ffprobe -version`
+
+Si no está disponible, BubbleCV puede ejecutar el Guided Runner sin ffprobe,
+pero no mostrará automáticamente esos metadatos.
+
+Para conversión de videos consulta:
+
+→ [`video_conversion.md`](./video_conversion.md)
+
+---
+
+## 13. Problemas comunes
+
+### `python` no se reconoce como comando
+
+Python probablemente no está en `PATH`.
+
+La solución más sencilla es reinstalar Python y seleccionar:
+
+`Add Python to PATH`
+
+Después cierra y vuelve a abrir PowerShell.
+
+---
+
+### PowerShell no ejecuta `Activate.ps1`
+
+Puedes utilizar Command Prompt:
+
+`venv\Scripts\activate.bat`
+
+Esto evita tener que modificar la política de ejecución de PowerShell.
+
+---
+
+### El video no puede ser leído
+
+Se recomienda utilizar:
+
+- contenedor MP4;
+- codec H.264;
+- cadencia CFR cuando el protocolo lo requiera.
+
+Consulta:
+
+→ [`video_conversion.md`](./video_conversion.md)
+
+---
+
+### La computadora entra en suspensión
+
+Consulta:
+
+→ [`prevent_sleep.md`](./prevent_sleep.md)
+
+---
+
+## 14. Resultados
+
+El Guided Runner crea por defecto una carpeta dentro de:
+
+`results/`
+
+Los archivos principales son:
+
+- `results.csv`;
+- `binned.csv`;
+- `summary.csv`;
+- `run_manifest.json`;
+- gráficas PNG.
+
+La carpeta `results/` está excluida del repositorio mediante `.gitignore`.
+
+---
+
+## 15. Desactivar el entorno
+
+Cuando termines:
+
+`deactivate`
